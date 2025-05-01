@@ -50,6 +50,11 @@ correct order.
 
 ## TL;DR
 
+#### Install vma-tool
+
+*vma-tool* is a single Python 3 script with no external dependencies, just
+download it and make it executable.
+
 #### Optimize a VMA file
 
 ```sh
