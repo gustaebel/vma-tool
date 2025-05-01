@@ -277,13 +277,18 @@ class VMAReader:
 
         for name, config in self.configurations.items():
             if name == "qemu-server.conf":
-                # XXX meh
-                config = config.decode("utf-8")
-                data = dict(split(line, ":") for line in config.splitlines()
-                            if not line.startswith("#"))
-                print("name:", data.get("name", "<unset>").strip())
+                config = Config(config)
+                print("name:", config.get("name", "<unset>"))
 
-        print("optimized:", str(self.header.uuid == OPTIMIZED_UUID).lower())
+        ordered_blocks, optimized_uuid = self.check_optimized(1024**3)
+        print("optimized:", end=" ")
+        if ordered_blocks:
+            if optimized_uuid:
+                print("yes")
+            else:
+                print("partially")
+        else:
+            print("no")
         print()
 
         print("configurations:")
@@ -295,6 +300,49 @@ class VMAReader:
         for dev_id, (name, size) in self.devices.items():
             print(f"  {dev_id}: {name} ({format_size(size)})")
         print()
+
+    def check_optimized(self, bytes_to_read=None):
+        """Check if the VMA file is optimized, i.e. if the data is ordered and if it uses the
+           default uuid.
+        """
+        optimized_uuid = self.header.uuid == OPTIMIZED_UUID
+
+        self.fobj.seek(self.header.header_size)
+
+        counter = {dev_id: 0 for dev_id in self.devices}
+        cluster_num = {}
+        while True:
+            extent_data = self.fobj.read(VMA_EXTENT_HEADER_SIZE)
+            if not extent_data:
+                break
+
+            extent = VMAExtentHeader(extent_data)
+
+            for blockinfo in extent.blockinfo:
+                dev_id = blockinfo.dev_id
+
+                if dev_id not in self.devices:
+                    continue
+
+                mask = blockinfo.mask
+                for _ in range(16):
+                    if mask & 1:
+                        self.fobj.read(4096)
+                    mask >>= 1
+
+                if blockinfo.cluster_num != cluster_num.get(dev_id, 0):
+                    counter[dev_id] += 1
+
+                cluster_num[dev_id] = blockinfo.cluster_num + 1
+
+            if bytes_to_read is not None and self.fobj.tell() >= bytes_to_read:
+                break
+
+        for c in counter.values():
+            if c > 0:
+                return False, optimized_uuid
+
+        return True, optimized_uuid
 
     def extract(self, directory, verbose, progress):
         """Extract all the configuration files and block device files to a <directory>.
