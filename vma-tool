@@ -344,7 +344,7 @@ class VMAReader:
 
         return True, optimized_uuid
 
-    def extract(self, directory, verbose, progress):
+    def unpack(self, directory, verbose, progress):
         """Extract all the configuration files and block device files to a <directory>.
         """
         # pylint:disable=consider-using-with
@@ -654,12 +654,12 @@ class Main:
             reader = VMAReader(src)
             reader.info()
 
-    def extract(self):
-        """Extract the contents of a VMA file to a directory.
+    def unpack(self):
+        """Unpack the contents of a VMA file to a directory.
         """
-        self._extract(self.args.destination)
+        self._unpack(self.args.destination)
 
-    def _extract(self, destination, check_optimized=False):
+    def _unpack(self, destination, check_optimized=False):
         if self.args.verbose:
             print("read", self.args.source)
             print("  working directory:", os.path.abspath(destination))
@@ -670,7 +670,7 @@ class Main:
                 if self.args.verbose:
                     print("  INFO: archive is already optimized")
                 sys.exit(0)
-            reader.extract(destination, self.args.verbose, self.args.progress)
+            reader.unpack(destination, self.args.verbose, self.args.progress)
         return reader.header.uuid, reader.header.ctime
 
     def pack(self):
@@ -761,7 +761,7 @@ class Main:
         os.rename(self.args.destination + ".tmp", self.args.destination)
 
     def optimize(self):
-        """Extract and repack a VMA file.
+        """Unpack and repack a VMA file.
         """
         if self.args.destination is None:
             self.args.destination = self.args.source
@@ -772,7 +772,7 @@ class Main:
             self.args.tmpdir = os.path.dirname(self.args.destination)
 
         with tempfile.TemporaryDirectory(dir=self.args.tmpdir) as tmpdir:
-            _, ctime = self._extract(tmpdir, True)
+            _, ctime = self._unpack(tmpdir, True)
             self._pack(tmpdir, OPTIMIZED_UUID, ctime)
 
 
@@ -788,16 +788,16 @@ def parse_arguments():
     dump_parser.set_defaults(command="info")
     dump_parser.add_argument("source", help="the vma file to read")
 
-    extract_parser = subparsers.add_parser("extract",
-                                       help="extract the contents of a vma file to a directory")
-    extract_parser.set_defaults(command="extract")
-    extract_parser.add_argument("-q", "--quiet", action="store_false", dest="verbose",
-                                default=True, help="suppress informational output")
-    extract_parser.add_argument("-P", "--no-progress", action="store_false", dest="progress",
-                                help="suppress progress output")
-    extract_parser.add_argument("source", help="the vma file to read")
-    extract_parser.add_argument("destination", default=os.getcwd(),
-                                help="extract to this directory")
+    unpack_parser = subparsers.add_parser("unpack",
+                                          help="unpack the contents of a vma file to a directory")
+    unpack_parser.set_defaults(command="unpack")
+    unpack_parser.add_argument("-q", "--quiet", action="store_false", dest="verbose",
+                               default=True, help="suppress informational output")
+    unpack_parser.add_argument("-P", "--no-progress", action="store_false", dest="progress",
+                               help="suppress progress output")
+    unpack_parser.add_argument("source", help="the vma file to read")
+    unpack_parser.add_argument("destination", default=os.getcwd(),
+                               help="extract to this directory")
 
     pack_parser = subparsers.add_parser("pack", help="create a vma file from a directory")
     pack_parser.set_defaults(command="pack")
