@@ -33,8 +33,8 @@ same guest VM. So, even if two VMA files contain the exact same data, they are
 guaranteed to differ after every 3776 KiB of data, i.e. at least 277 times per
 1 GiB.
 
-Solution: *vma-tool* repacks the VMA file using the same default uuid
-(`12345678-aabb-ccdd-eeff-aabbccddeeff`) for every file. The fact that the uuid
+**Solution:** *vma-tool* repacks the VMA file using the same default uuid
+`12345678-aabb-ccdd-eeff-aabbccddeeff` for every file. The fact that the uuid
 is no longer random seems to have no adverse effects.
 
 
@@ -44,6 +44,92 @@ Far worse with regard to effective deduplication is that the order in which the
 64 KiB data clusters are stored is non-deterministic and therefore different
 every time . This destroys any attempt at deduplication entirely.
 
-Solution: *vma-tool* repacks the VMA file storing all data blocks in the
+**Solution:** *vma-tool* repacks the VMA file storing all data blocks in the
 correct order.
 
+
+## TL;DR
+
+#### Optimize a VMA file
+
+```sh
+vma-tool optimize source.vma destination.vma
+```
+
+If `destination.vma` is omitted `source.vma` will be overwritten with the
+optimized version.
+
+#### Unpack a VMA file
+
+```sh
+vma-tool unpack source.vma destination/
+```
+
+#### Pack a VMA file
+
+```sh
+vma-tool pack source/ destination.vma
+```
+
+
+## Tests and Numbers
+
+I created a small makeshift test setup to demonstrate the effects with some
+numbers. I used two test VMA files (let us call them `a.vma` and `b.vma`) which
+both were **19125 MiB** in size.
+
+For both *restic* and *librsync*, I did three passes with three different
+versions of the same VMA files:
+
+- original: The unaltered original VMA files as Proxmox backup produced them.
+- ordered data: Repacked versions of the VMA files with the data blocks in the
+  right order.
+- optimized: Repacked versions with ordered data blocks *and* the uuid "hack".
+
+#### restic
+
+The *restic* test creates an empty repository with compression switched off to
+test the isolated effects of deduplication. The *Delta Size* column displays
+the size difference of the restic repository between before and after adding
+`b.vma` to it.
+
+```sh
+restic init
+
+restic backup a.vma
+size1 = get-size a.vma
+
+restic backup b.vma
+size2 = get-size b.vma
+
+delta-size = size2 - size1
+```
+
+| Test          | Delta Size    | Space Saved   |
+| ------------- | ------------- | ------------- |
+| original      | 19125 MiB     | 0.0 %         |
+| ordered data  | 7579 MiB      | 60.4 %        |
+| optimized     | 48 MiB        | 99.7 %        |
+
+
+#### librsync
+
+The *librsync* test is similar. `rdiff` is used to create the delta
+between `a.vma` and `b.vma`. The size of the resulting delta file is shown in
+the column *Delta Size*.
+
+```sh
+rdiff signature a.vma sig
+rdiff delta sig b.vma delta-file
+
+delta-size = get-size delta-file
+```
+
+The column *Space Saved* compares the *Delta Size* to the original file size of
+`b.vma`, i.e. 19125 MiB.
+
+| Test          | Delta Size    | Space Saved   |
+| ------------- | ------------- | ------------- |
+| original      | 18772 MiB     | 1.8 %         |
+| ordered data  | 820 MiB       | 95.7 %        |
+| optimized     | 25 MiB        | 99.9 %        |
