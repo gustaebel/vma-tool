@@ -138,12 +138,6 @@ class VMADeviceInfo(_Structure):
     """Block device information structure.
     """
 
-    # ("devname_ptr", uint32),    # blob pointer to the device name
-    # (None, 4),
-    # ("size", uint64),           # size of the device
-    # (None, 8),
-    # (None, 8)
-
     _struct = Struct("> I 4x Q 16x")
 
     def parse(self, offset, record):
@@ -155,27 +149,33 @@ class VMAHeader(_Structure):
     """Global vma file header structure.
     """
 
-    # ("magic", bytes4),          # 'VMA\0'
-    # ("version", uint32),        # version 1
-    # ("uuid", bytes16),          # unique id, also used in extents
-    # ("ctime", uint64),          # creation time
-    # ("md5sum", bytes16),        # md5sum of the header
-
-    # ("blob_buffer_offset", uint32),     # start of the blob buffer
-    # ("blob_buffer_size", uint32),       # size of the blob buffer
-    # ("header_size", uint32),            # size of the header including the blob buffer
-
-    # (None, 1984),
-
-    # ("config_names", array.new(uint32, VMA_MAX_CONFIGS)),
-    #                                     # list of blob pointers to config file names
-    # ("config_data", array.new(uint32, VMA_MAX_CONFIGS)),
-    #                                     # list of blob pointers to config file data
-    # (None, 4),
-    # ("dev_info", array.new(VMADeviceInfo, 256))
-    #                                     # list of block device info structures
-
     _struct = Struct("> 4s I 16s Q 16s I I I 1984x 256I 256I 4x 8192s")
+
+    @classmethod
+    def read(cls, fobj):
+        obj = super().read(fobj)
+
+        assert fobj.tell() == obj.blob_buffer_offset
+
+        blob_buffer = BlobBuffer.read(fobj, obj.blob_buffer_size)
+
+        obj.configurations = {}
+        for name_ptr, data_ptr in zip(obj.config_names, obj.config_data):
+            if name_ptr == 0:
+                continue
+            name = os.fsdecode(blob_buffer[name_ptr])
+            data = blob_buffer[data_ptr]
+            obj.configurations[name] = data
+
+        obj.devices = {}
+        for dev_id, dev in enumerate(obj.dev_info):
+            if dev.size == 0:
+                continue
+            name = os.fsdecode(blob_buffer[dev.devname_ptr])
+            obj.devices[dev_id] = (name, obj.dev_info[dev_id].size)
+
+        fobj.seek(obj.header_size)
+        return obj
 
     def parse(self, offset, record):
         self.offset = offset
@@ -219,11 +219,6 @@ class Blockinfo(_Structure):
     """Structure that holds information about one cluster of data in an extent header.
     """
 
-    # ("mask", uint16),       # bitmask 1-data 0-hole
-    # (None, 1),
-    # ("dev_id", uint8),      # device id
-    # ("cluster_num", uint32) # position in the device file, in 65536-byte units
-
     _struct = Struct("> H x B I")
 
     def parse(self, offset, record):
@@ -234,14 +229,6 @@ class Blockinfo(_Structure):
 class VMAExtentHeader(_Structure):
     """Extent header that contains up to 59 clusters with 16 4096-byte-blocks each.
     """
-
-    # ("magic", bytes4),          # 'VMAE'
-    # (None, 2),
-    # ("block_count", uint16),    # number of 4096-byte data blocks
-    # ("uuid", bytes16),          # unique id, the same as in the global header
-    # ("md5sum", bytes16),        # md5sum of the extent header
-    # ("blockinfo", array.new(Blockinfo, VMA_BLOCKS_PER_EXTENT))
-    #                                # table of up to 59 blockinfos
 
     _struct = Struct("> 4s 2x H 16s 16s 472s")
 
@@ -307,27 +294,7 @@ class VMAReader:
 
     def __init__(self, fobj):
         self.fobj = fobj
-
         self.header = VMAHeader.read(self.fobj)
-
-        assert self.fobj.tell() == self.header.blob_buffer_offset
-
-        self.blob_buffer = BlobBuffer.read(self.fobj, self.header.blob_buffer_size)
-
-        self.configurations = {}
-        for name_ptr, data_ptr in zip(self.header.config_names, self.header.config_data):
-            if name_ptr == 0:
-                continue
-            name = os.fsdecode(self.blob_buffer[name_ptr])
-            data = self.blob_buffer[data_ptr]
-            self.configurations[name] = data
-
-        self.devices = {}
-        for dev_id, dev in enumerate(self.header.dev_info):
-            if dev.size == 0:
-                continue
-            name = os.fsdecode(self.blob_buffer[dev.devname_ptr])
-            self.devices[dev_id] = (name, self.header.dev_info[dev_id].size)
 
     def info(self):
         """Show detailed information about a VMA file.
@@ -338,7 +305,7 @@ class VMAReader:
         print("created:", time.asctime(time.localtime(self.header.ctime)))
         print("size:", format_size(os.fstat(self.fobj.fileno()).st_size))
 
-        for name, config in self.configurations.items():
+        for name, config in self.header.configurations.items():
             if name == "qemu-server.conf":
                 config = Config(config)
                 print("name:", config.get("name", "<unset>"))
@@ -355,12 +322,12 @@ class VMAReader:
         print()
 
         print("configurations:")
-        for name, config in self.configurations.items():
+        for name, config in self.header.configurations.items():
             print(f"  {name} ({format_size(len(config))})")
         print()
 
         print("devices:")
-        for dev_id, (name, size) in self.devices.items():
+        for dev_id, (name, size) in self.header.devices.items():
             print(f"  {dev_id}: {name} ({format_size(size)})")
         print()
 
@@ -370,9 +337,7 @@ class VMAReader:
         """
         optimized_uuid = self.header.uuid == OPTIMIZED_UUID
 
-        self.fobj.seek(self.header.header_size)
-
-        counter = {dev_id: 0 for dev_id in self.devices}
+        counter = {dev_id: 0 for dev_id in self.header.devices}
         cluster_num = {}
         while True:
             offset = self.fobj.tell()
@@ -387,7 +352,7 @@ class VMAReader:
             for blockinfo in extent.blockinfo:
                 dev_id = blockinfo.dev_id
 
-                if dev_id not in self.devices:
+                if dev_id not in self.header.devices:
                     continue
 
                 mask = blockinfo.mask
@@ -419,7 +384,7 @@ class VMAReader:
         except FileExistsError:
             pass
 
-        for name, config in self.configurations.items():
+        for name, config in self.header.configurations.items():
             path = os.path.join(directory, name)
             if verbose:
                 print("  extract config", name)
@@ -430,7 +395,7 @@ class VMAReader:
         devices = {}
         sizes = {}
         try:
-            for dev_id, (name, size) in self.devices.items():
+            for dev_id, (name, size) in self.header.devices.items():
                 path = os.path.join(directory, name)
                 devices[dev_id] = open(path + ".tmp", "wb")
                 sizes[dev_id] = size
@@ -448,8 +413,6 @@ class VMAReader:
         """Iterate through the VMA file extents and extract the data for all block devices
            simultaneously.
         """
-        self.fobj.seek(self.header.header_size)
-
         total = os.fstat(self.fobj.fileno()).st_size
         while True:
             offset = self.fobj.tell()
