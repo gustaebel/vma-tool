@@ -111,37 +111,23 @@ class _Structure:
     def read(cls, fobj):
         """Read and create an object from file object <fobj>.
         """
-        return cls.from_buf(fobj.tell(), safe_read(fobj, cls._struct.size))
-
-    @classmethod
-    def from_buf(cls, offset, buf):
-        """Create an object from a structured buffer.
-        """
-        assert len(buf) == cls._struct.size
+        offset = fobj.tell()
+        buf = safe_read(fobj, cls._struct.size)
         obj = cls.__new__(cls) # we don't call __init__()
         obj._offset = offset
         obj._buf = buf
-        obj.unpack(cls._struct.unpack(buf))
+        obj.unpack(fobj, cls._struct.unpack(buf))
         return obj
 
     @classmethod
-    def array_from_buf(cls, offset, buf):
-        """Create a list of objects from a structured buffer.
-        """
-        assert len(buf) % cls._struct.size == 0
+    def read_array(cls, fobj, count):
         a = []
-        o = 0
-        while o < len(buf):
-            obj = cls.__new__(cls) # we don't call __init__()
-            obj._offset = offset + o
-            obj._buf = buf[o:o + cls._struct.size]
-            obj.unpack(cls._struct.unpack(obj._buf))
-            o += cls._struct.size
-            a.append(obj)
+        for _ in range(count):
+            a.append(cls.read(fobj))
         return a
 
     # FIXME name
-    def unpack(self, record):
+    def unpack(self, fobj, record):
         """Initialize an instance from the values in <record>.
         """
         raise NotImplementedError
@@ -165,7 +151,7 @@ class VMADeviceInfo(_Structure):
         self.devname_ptr = devname_ptr
         self.size = size
 
-    def unpack(self, record):
+    def unpack(self, fobj, record):
         self.devname_ptr, self.size = record
 
     def pack(self):
@@ -176,7 +162,7 @@ class VMAHeader(_Structure):
     """Global vma file header structure.
     """
 
-    _struct = Struct("> 4s I 16s Q 16s I I I 1984x 256I 256I 4x 8192s")
+    _struct = Struct("> 4s I 16s Q 16s I I I 1984x 256I 256I 4x")
 
     def __init__(self, uuid, ctime=None):
         super().__init__()
@@ -189,51 +175,42 @@ class VMAHeader(_Structure):
         self.devices = {}
         self.dev_id = 1
 
-    @classmethod
-    def read(cls, fobj):
-        obj = cls.from_buf(fobj.tell(), safe_read(fobj, cls._struct.size))
-
-        assert fobj.tell() == obj.blob_buffer_offset
-
-        buf = safe_read(fobj, obj.header_size - obj.blob_buffer_offset)
-        obj._buf += buf
-        blob_buffer = BlobBuffer.from_buf(obj.blob_buffer_offset, buf[:obj.blob_buffer_size])
-
-        obj.configurations = {}
-        for name_ptr, data_ptr in zip(obj.config_names, obj.config_data):
-            if name_ptr == 0:
-                continue
-            name = os.fsdecode(blob_buffer[name_ptr])
-            data = blob_buffer[data_ptr]
-            obj.configurations[name] = data
-
-        obj.devices = {}
-        for dev_id, dev in enumerate(obj.dev_info):
-            if dev.size == 0:
-                continue
-            name = os.fsdecode(blob_buffer[dev.devname_ptr])
-            obj.devices[dev_id] = (name, obj.dev_info[dev_id].size)
-
-        if md5(obj._buf[:32] + b"\0" * 16 + obj._buf[48:]) != obj.md5sum:
-            raise SystemExit(f"ERROR: corrupt file, damaged VMA header at 0x{obj._offset:x}!")
-
-        return obj
-
-    def unpack(self, record):
+    def unpack(self, fobj, record):
         magic, version, self.uuid, self.ctime, self.md5sum, self.blob_buffer_offset, \
                 self.blob_buffer_size, self.header_size = record[:8]
-
-        self.config_names = record[8:264]
-        self.config_data = record[264:520]
-        dev_info_buf = record[520]
-
-        self.dev_info = VMADeviceInfo.array_from_buf(self._offset - 8192, dev_info_buf)
 
         if magic != b"VMA\0":
             raise SystemExit("ERROR: not a VMA file")
 
         if version != 1:
             raise SystemExit("ERROR: only VMA version 1 is supported!")
+
+        config_names = record[8:264]
+        config_data = record[264:520]
+
+        dev_info = VMADeviceInfo.read_array(fobj, VMA_MAX_DEVICES)
+        self._buf += b"".join(d._buf for d in dev_info)
+
+        blob_buffer = BlobBuffer.read(fobj, self.blob_buffer_size)
+        self._buf += blob_buffer._buf + safe_read(fobj, self.header_size - fobj.tell())
+
+        self.configurations = {}
+        for name_ptr, data_ptr in zip(config_names, config_data):
+            if name_ptr == 0:
+                continue
+            name = os.fsdecode(blob_buffer[name_ptr])
+            data = blob_buffer[data_ptr]
+            self.configurations[name] = data
+
+        self.devices = {}
+        for dev_id, dev in enumerate(dev_info):
+            if dev.size == 0:
+                continue
+            name = os.fsdecode(blob_buffer[dev.devname_ptr])
+            self.devices[dev_id] = (name, dev_info[dev_id].size)
+
+        if md5(self._buf[:32] + b"\0" * 16 + self._buf[48:]) != self.md5sum:
+            raise SystemExit(f"ERROR: corrupt file, damaged VMA header at 0x{self._offset:x}!")
 
     def add_config(self, name, data):
         """Add a configuration file to the blob buffer.
@@ -276,7 +253,9 @@ class VMAHeader(_Structure):
         self._buf.write(self._struct.pack(b"VMA\0", 1, self.uuid, self.ctime, b"\0" * 16,
                                           VMA_HEADER_SIZE, self.blob_buffer.size,
                                           VMA_HEADER_SIZE + block512(self.blob_buffer.size),
-                                          *config_names, *config_data, dev_info_buf))
+                                          *config_names, *config_data))
+
+        self._buf.write(dev_info_buf)
 
         self._buf.write(self.blob_buffer.pack())
 
@@ -302,10 +281,11 @@ class BlobBuffer(dict):
         return self._buf.tell()
 
     @classmethod
-    def from_buf(cls, offset, buf):
-        """Create an object from a structured buffer.
-        """
-        obj = cls()
+    def read(cls, fobj, size):
+        offset = fobj.tell()
+        buf = safe_read(fobj, size)
+
+        obj = cls.__new__(cls)
         obj._offset = offset
         obj._buf = buf
 
@@ -357,7 +337,7 @@ class Blockinfo(_Structure):
 
         self.blocks = []
 
-    def unpack(self, record):
+    def unpack(self, fobj, record):
         self.mask, self.dev_id, self.cluster_num = record
 
     def iterate(self, fobj):
@@ -398,18 +378,19 @@ class VMAExtentHeader(_Structure):
     """Extent header that contains up to 59 clusters with 16 4096-byte-blocks each.
     """
 
-    _struct = Struct("> 4s 2x H 16s 16s 472s")
+    _struct = Struct("> 4s 2x H 16s 16s")
 
-    def unpack(self, record):
-        magic, self.block_count, self.uuid, self.md5sum, blockinfo_buf = record
+    def unpack(self, fobj, record):
+        magic, self.block_count, self.uuid, self.md5sum = record
 
         if magic != b"VMAE":
             raise SystemExit(f"ERROR: corrupt file, no VMA extent found at 0x{self._offset:x}!")
 
+        self.blockinfo = Blockinfo.read_array(fobj, VMA_BLOCKS_PER_EXTENT)
+        self._buf += b"".join(b._buf for b in self.blockinfo)
+
         if md5(self._buf[:24] + b"\0" * 16 + self._buf[40:]) != self.md5sum:
             raise SystemExit(f"ERROR: corrupt file, damaged VMA extent at 0x{self._offset:x}!")
-
-        self.blockinfo = Blockinfo.array_from_buf(self._offset - 472, blockinfo_buf)
 
     def __init__(self, dev_id, uuid, cluster_num):
         super().__init__()
@@ -447,8 +428,8 @@ class VMAExtentHeader(_Structure):
                 blockinfo_buf.write(blockinfo.pack())
 
         # Build the header structure.
-        self._buf.write(self._struct.pack(b"VMAE", self.block_count, self.uuid, b"\0" * 16,
-                                          blockinfo_buf.getvalue()))
+        self._buf.write(self._struct.pack(b"VMAE", self.block_count, self.uuid, b"\0" * 16))
+        self._buf.write(blockinfo_buf.getvalue())
 
         buf = self._buf.getbuffer()
         buf[24:40] = md5(buf)
