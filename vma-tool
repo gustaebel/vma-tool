@@ -42,6 +42,7 @@ import hashlib
 import argparse
 import tempfile
 
+from struct import Struct
 from uuid import UUID, uuid4
 
 OPTIMIZED_UUID = bytes.fromhex("12345678aabbccddeeffaabbccddeeff")
@@ -92,104 +93,39 @@ def safe_read(fobj, size):
     return buf
 
 
-class _uint:
-
-    _size = None
-
-    @classmethod
-    def read(cls, fobj, byteorder="big"):
-        return int.from_bytes(safe_read(fobj, cls._size), byteorder=byteorder, signed=False)
-
-    @classmethod
-    def write(cls, fobj, value, byteorder="big"):
-        fobj.write(int.to_bytes(value, cls._size, byteorder=byteorder, signed=False))
-
-class uint8(_uint):
-    _size = 1
-
-class uint16(_uint):
-    _size = 2
-
-class uint32(_uint):
-    _size = 4
-
-class uint64(_uint):
-    _size = 8
-
-class _bytes:
-
-    _size = None
-
-    @classmethod
-    def read(cls, fobj):
-        return safe_read(fobj, cls._size)
-
-    @classmethod
-    def write(cls, fobj, value):
-        assert len(value) == cls._size
-        fobj.write(value)
-
-class bytes4(_bytes):
-    _size = 4
-
-class bytes16(_bytes):
-    _size = 16
-
-class array(list):
-
-    @classmethod
-    def new(cls, _type, count):
-        return type(f"{_type.__name__}{count}", (cls,), {"_type": _type, "count": count,
-                                                         "size": _type._size * count})
-
-    @classmethod
-    def read(cls, fobj):
-        return cls(cls._type.read(fobj) for i in range(cls.count))
-
-    @classmethod
-    def write(cls, fobj, values):
-        assert isinstance(values, cls)
-        assert len(values) == cls.count
-        for value in values:
-            assert isinstance(value, cls._type)
-            cls._type.write(fobj, value)
-
-
 class _Structure:
     """Represent a fixed-size structured binary buffer.
     """
     # pylint:disable=missing-function-docstring
 
-    _size = 0
-    _fields = []
-
-    def __init__(self, offset):
-        self.offset = offset
-        self.buf = io.BytesIO()
+    _struct = Struct("")
 
     @classmethod
     def read(cls, fobj):
-        # FIXME
-        #size = 0
-        #for name, _type in self._fields:
-        #    size += _type._size
-        return cls.from_buf(fobj.tell(), safe_read(fobj, cls._size))
+        return cls.from_buf(fobj.tell(), safe_read(fobj, cls._struct.size))
 
     @classmethod
     def from_buf(cls, offset, buf):
-        obj = cls(offset)
-        obj.buf.write(buf)
-        obj.buf.seek(0)
-        obj.parse()
+        assert len(buf) == cls._struct.size
+        obj = cls()
+        obj.parse(offset, cls._struct.unpack(buf))
         return obj
 
-    def parse(self):
-        for name, _type in self._fields:
-            if name is None and type(_type) is int:
-                self.buf.read(_type)
-            else:
-                value = _type.read(self.buf)
-                setattr(self, name, value)
+    @classmethod
+    def array_from_buf(cls, offset, buf):
+        assert len(buf) % cls._struct.size == 0
+        a = []
+        o = 0
+        while o < len(buf):
+            obj = cls()
+            obj.parse(offset + o, cls._struct.unpack(buf[o:o + cls._struct.size]))
+            o += cls._struct.size
+            a.append(obj)
+        return a
+
+    # FIXME name
+    def parse(self, offset, record):
+        raise NotImplementedError
 
     def __repr__(self):
         d = vars(self).copy()
@@ -202,45 +138,55 @@ class VMADeviceInfo(_Structure):
     """Block device information structure.
     """
 
-    _size = 32
-    _fields = [
-        ("devname_ptr", uint32),    # blob pointer to the device name
-        (None, 4),
-        ("size", uint64),           # size of the device
-        (None, 8),
-        (None, 8)
-    ]
+    # ("devname_ptr", uint32),    # blob pointer to the device name
+    # (None, 4),
+    # ("size", uint64),           # size of the device
+    # (None, 8),
+    # (None, 8)
+
+    _struct = Struct("> I 4x Q 16x")
+
+    def parse(self, offset, record):
+        self.offset = offset
+        self.devname_ptr, self.size = record
 
 
 class VMAHeader(_Structure):
     """Global vma file header structure.
     """
 
-    _size = VMA_HEADER_SIZE
-    _fields = [
-        ("magic", bytes4),          # 'VMA\0'
-        ("version", uint32),        # version 1
-        ("uuid", bytes16),          # unique id, also used in extents
-        ("ctime", uint64),          # creation time
-        ("md5sum", bytes16),        # md5sum of the header
+    # ("magic", bytes4),          # 'VMA\0'
+    # ("version", uint32),        # version 1
+    # ("uuid", bytes16),          # unique id, also used in extents
+    # ("ctime", uint64),          # creation time
+    # ("md5sum", bytes16),        # md5sum of the header
 
-        ("blob_buffer_offset", uint32),     # start of the blob buffer
-        ("blob_buffer_size", uint32),       # size of the blob buffer
-        ("header_size", uint32),            # size of the header including the blob buffer
+    # ("blob_buffer_offset", uint32),     # start of the blob buffer
+    # ("blob_buffer_size", uint32),       # size of the blob buffer
+    # ("header_size", uint32),            # size of the header including the blob buffer
 
-        (None, 1984),
+    # (None, 1984),
 
-        ("config_names", array.new(uint32, VMA_MAX_CONFIGS)),
-                                            # list of blob pointers to config file names
-        ("config_data", array.new(uint32, VMA_MAX_CONFIGS)),
-                                            # list of blob pointers to config file data
-        (None, 4),
-        ("dev_info", array.new(VMADeviceInfo, 256))
-                                            # list of block device info structures
-    ]
+    # ("config_names", array.new(uint32, VMA_MAX_CONFIGS)),
+    #                                     # list of blob pointers to config file names
+    # ("config_data", array.new(uint32, VMA_MAX_CONFIGS)),
+    #                                     # list of blob pointers to config file data
+    # (None, 4),
+    # ("dev_info", array.new(VMADeviceInfo, 256))
+    #                                     # list of block device info structures
 
-    def parse(self):
-        super().parse()
+    _struct = Struct("> 4s I 16s Q 16s I I I 1984x 256I 256I 4x 8192s")
+
+    def parse(self, offset, record):
+        self.offset = offset
+        self.magic, self.version, self.uuid, self.ctime, self.md5sum, self.blob_buffer_offset, \
+                self.blob_buffer_size, self.header_size = record[:8]
+
+        self.config_names = record[8:264]
+        self.config_data = record[264:520]
+        dev_info_buf = record[520]
+
+        self.dev_info = VMADeviceInfo.array_from_buf(self.offset - 8192, dev_info_buf)
 
         if self.magic != b"VMA\0":
             raise SystemExit("ERROR: not a VMA file")
@@ -256,13 +202,15 @@ class BlobBuffer(dict):
     """A dictionary holding the blobs.
     """
 
+    _struct = Struct("<H")
+
     @classmethod
     def read(cls, fobj, _size):
         obj = cls()
         start = fobj.tell()
         safe_read(fobj, 1) # skip the first byte
         while (offset := fobj.tell() - start) < _size:
-            size = uint16.read(fobj, "little")
+            size = obj._struct.unpack(safe_read(fobj, obj._struct.size))[0]
             obj[offset] = bytes(safe_read(fobj, size)).rstrip(b"\0")
         return obj
 
@@ -271,39 +219,45 @@ class Blockinfo(_Structure):
     """Structure that holds information about one cluster of data in an extent header.
     """
 
-    _size = 8
-    _fields = [
-        ("mask", uint16),       # bitmask 1-data 0-hole
-        (None, 1),
-        ("dev_id", uint8),      # device id
-        ("cluster_num", uint32) # position in the device file, in 65536-byte units
-    ]
+    # ("mask", uint16),       # bitmask 1-data 0-hole
+    # (None, 1),
+    # ("dev_id", uint8),      # device id
+    # ("cluster_num", uint32) # position in the device file, in 65536-byte units
+
+    _struct = Struct("> H x B I")
+
+    def parse(self, offset, record):
+        self.offset = offset
+        self.mask, self.dev_id, self.cluster_num = record
 
 
 class VMAExtentHeader(_Structure):
     """Extent header that contains up to 59 clusters with 16 4096-byte-blocks each.
     """
 
-    _size = VMA_EXTENT_HEADER_SIZE
-    _fields = [
-        ("magic", bytes4),          # 'VMAE'
-        (None, 2),
-        ("block_count", uint16),    # number of 4096-byte data blocks
-        ("uuid", bytes16),          # unique id, the same as in the global header
-        ("md5sum", bytes16),        # md5sum of the extent header
-        ("blockinfo", array.new(Blockinfo, VMA_BLOCKS_PER_EXTENT))
-                                    # table of up to 59 blockinfos
-    ]
+    # ("magic", bytes4),          # 'VMAE'
+    # (None, 2),
+    # ("block_count", uint16),    # number of 4096-byte data blocks
+    # ("uuid", bytes16),          # unique id, the same as in the global header
+    # ("md5sum", bytes16),        # md5sum of the extent header
+    # ("blockinfo", array.new(Blockinfo, VMA_BLOCKS_PER_EXTENT))
+    #                                # table of up to 59 blockinfos
 
-    def parse(self):
-        super().parse()
+    _struct = Struct("> 4s 2x H 16s 16s 472s")
+
+    def parse(self, offset, record):
+        self.offset = offset
+        self.magic, self.block_count, self.uuid, self.md5sum, blockinfo_buf = record
 
         if self.magic != b"VMAE":
             raise SystemExit(f"ERROR: corrupt file, no VMA extent found at 0x{self.offset:x}!")
 
-        buf = self.buf.getbuffer()
-        if md5(bytes(buf[:24]) + b"\0" * 16 + bytes(buf[40:])) != self.md5sum:
-            raise SystemExit(f"ERROR: corrupt file, damaged VMA extent at 0x{self.offset:x}!")
+        # FIXME
+        #buf = self.buf.getbuffer()
+        #if md5(bytes(buf[:24]) + b"\0" * 16 + bytes(buf[40:])) != self.md5sum:
+        #    raise SystemExit(f"ERROR: corrupt file, damaged VMA extent at 0x{self.offset:x}!")
+
+        self.blockinfo = Blockinfo.array_from_buf(self.offset - 472, blockinfo_buf)
 
 
 class Config:
