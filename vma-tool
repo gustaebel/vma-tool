@@ -29,7 +29,7 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# pylint:disable=too-many-instance-attributes
+# pylint:disable=invalid-name,too-many-instance-attributes,attribute-defined-outside-init
 
 """Manage and optimize Proxmox VMA (virtual machine archive) files.
 """
@@ -56,6 +56,9 @@ VMA_BLOCKS_PER_EXTENT = 59
 
 
 class EOF(EOFError):
+    """An EOFError subclass that stores a file offset.
+    """
+
     def __init__(self, offset):
         super().__init__()
         self.offset = offset
@@ -86,6 +89,8 @@ def format_size(size):
     return f"{size / base:.{precision}f} {unit}"
 
 def safe_read(fobj, size):
+    """Read <size> bytes from <fobj> and raise EOF if there was not enough data.
+    """
     offset = fobj.tell()
     buf = fobj.read(size)
     if len(buf) != size:
@@ -96,19 +101,22 @@ def safe_read(fobj, size):
 class _Structure:
     """Represent a fixed-size structured binary buffer.
     """
-    # pylint:disable=missing-function-docstring
 
     _struct = Struct("")
 
     def __init__(self):
-        self._buf = io.BytesIO() # FIXME this is overwritten in from_buf() when parsing
+        self._buf = io.BytesIO()
 
     @classmethod
     def read(cls, fobj):
+        """Read and create an object from file object <fobj>.
+        """
         return cls.from_buf(fobj.tell(), safe_read(fobj, cls._struct.size))
 
     @classmethod
     def from_buf(cls, offset, buf):
+        """Create an object from a structured buffer.
+        """
         assert len(buf) == cls._struct.size
         obj = cls.__new__(cls) # we don't call __init__()
         obj._offset = offset
@@ -118,6 +126,8 @@ class _Structure:
 
     @classmethod
     def array_from_buf(cls, offset, buf):
+        """Create a list of objects from a structured buffer.
+        """
         assert len(buf) % cls._struct.size == 0
         a = []
         o = 0
@@ -132,6 +142,14 @@ class _Structure:
 
     # FIXME name
     def parse(self, record):
+        """Initialize an instance from the values in <record>.
+        """
+        raise NotImplementedError
+
+    # FIXME name
+    def render(self):
+        """Return a structured buffer representation of this instance.
+        """
         raise NotImplementedError
 
 
@@ -173,7 +191,7 @@ class VMAHeader(_Structure):
 
     @classmethod
     def read(cls, fobj):
-        obj = super().read(fobj)
+        obj = cls.from_buf(fobj.tell(), safe_read(fobj, cls._struct.size))
 
         assert fobj.tell() == obj.blob_buffer_offset
 
@@ -203,7 +221,7 @@ class VMAHeader(_Structure):
         return obj
 
     def parse(self, record):
-        self.magic, self.version, self.uuid, self.ctime, self.md5sum, self.blob_buffer_offset, \
+        magic, version, self.uuid, self.ctime, self.md5sum, self.blob_buffer_offset, \
                 self.blob_buffer_size, self.header_size = record[:8]
 
         self.config_names = record[8:264]
@@ -212,10 +230,10 @@ class VMAHeader(_Structure):
 
         self.dev_info = VMADeviceInfo.array_from_buf(self._offset - 8192, dev_info_buf)
 
-        if self.magic != b"VMA\0":
+        if magic != b"VMA\0":
             raise SystemExit("ERROR: not a VMA file")
 
-        if self.version != 1:
+        if version != 1:
             raise SystemExit("ERROR: only VMA version 1 is supported!")
 
     def add_config(self, name, data):
@@ -260,10 +278,14 @@ class BlobBuffer(dict):
 
     @property
     def size(self):
+        """Return the size of the blob buffer.
+        """
         return self._buf.tell()
 
     @classmethod
     def from_buf(cls, offset, buf):
+        """Create an object from a structured buffer.
+        """
         obj = cls()
         obj._offset = offset
         obj._buf = buf
@@ -294,7 +316,9 @@ class BlobBuffer(dict):
         self._buf.write(s)
         return offset
 
-    def render(self): # FIXME name?
+    def render(self):
+        """Return a structured buffer representation of this instance.
+        """
         buf = self._buf.getvalue()
         return buf + b"\0" * (block512(len(buf)) - len(buf))
 
@@ -312,10 +336,14 @@ class Blockinfo(_Structure):
         self.dev_id = dev_id
         self.cluster_num = cluster_num
 
+        self.blocks = []
+
     def parse(self, record):
         self.mask, self.dev_id, self.cluster_num = record
 
     def iterate(self, fobj):
+        """Iterate over the blocks of data in this Blockinfo. Holes are yielded as None values.
+        """
         mask = self.mask
         for _ in range(16):
             if mask & 1:
@@ -327,8 +355,6 @@ class Blockinfo(_Structure):
     def add(self, cluster):
         """Store a cluster of blocks.
         """
-        self.blocks = []
-
         for i in range(16):
             offset = i * 4096
             block = cluster[offset:offset+4096]
@@ -356,9 +382,9 @@ class VMAExtentHeader(_Structure):
     _struct = Struct("> 4s 2x H 16s 16s 472s")
 
     def parse(self, record):
-        self.magic, self.block_count, self.uuid, self.md5sum, blockinfo_buf = record
+        magic, self.block_count, self.uuid, self.md5sum, blockinfo_buf = record
 
-        if self.magic != b"VMAE":
+        if magic != b"VMAE":
             raise SystemExit(f"ERROR: corrupt file, no VMA extent found at 0x{self._offset:x}!")
 
         if md5(self._buf[:24] + b"\0" * 16 + self._buf[40:]) != self.md5sum:
@@ -396,6 +422,7 @@ class VMAExtentHeader(_Structure):
             try:
                 blockinfo = self.blockinfos[i]
             except IndexError:
+                # pylint:disable=protected-access
                 blockinfo_buf.write(b"\0" * Blockinfo._struct.size)
             else:
                 blockinfo_buf.write(blockinfo.render())
@@ -468,7 +495,6 @@ class VMAReader:
         """Show detailed information about a VMA file.
         """
         print("filename:", self.fobj.name)
-        print("version:", self.header.version)
         print("uuid:", UUID(bytes=self.header.uuid))
         print("created:", time.asctime(time.localtime(self.header.ctime)))
         print("size:", format_size(os.fstat(self.fobj.fileno()).st_size))
@@ -512,10 +538,10 @@ class VMAReader:
             try:
                 extent = VMAExtentHeader.read(self.fobj)
             except EOF as exc:
+                # pylint:disable=raise-missing-from
                 if exc.offset == offset:
                     break
-                else:
-                    raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
+                raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
 
             for blockinfo in extent.blockinfo:
                 dev_id = blockinfo.dev_id
@@ -523,7 +549,7 @@ class VMAReader:
                 if dev_id not in self.header.devices:
                     continue
 
-                for buf in blockinfo.iterate(self.fobj):
+                for _ in blockinfo.iterate(self.fobj):
                     pass
 
                 if blockinfo.cluster_num != cluster_num.get(dev_id, 0):
@@ -584,10 +610,10 @@ class VMAReader:
             try:
                 extent = VMAExtentHeader.read(self.fobj)
             except EOF as exc:
+                # pylint:disable=raise-missing-from
                 if exc.offset == offset:
                     break
-                else:
-                    raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
+                raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
 
             for blockinfo in extent.blockinfo:
                 if blockinfo.dev_id not in devices:
