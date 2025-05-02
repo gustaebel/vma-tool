@@ -54,6 +54,11 @@ VMA_MAX_DEVICES = 256
 VMA_BLOCKS_PER_EXTENT = 59
 
 
+class EOF(EOFError):
+    def __init__(self, offset):
+        super().__init__()
+        self.offset = offset
+
 def md5(buf):
     """Calculate an md5 sum from a buffer.
     """
@@ -79,83 +84,163 @@ def format_size(size):
             break
     return f"{size / base:.{precision}f} {unit}"
 
+def safe_read(fobj, size):
+    offset = fobj.tell()
+    buf = fobj.read(size)
+    if len(buf) != size:
+        raise EOF(offset)
+    return buf
 
-class _StructParser:
-    """Parse a structured binary buffer.
+
+class _uint:
+
+    _size = None
+
+    @classmethod
+    def read(cls, fobj, byteorder="big"):
+        return int.from_bytes(safe_read(fobj, cls._size), byteorder=byteorder, signed=False)
+
+    @classmethod
+    def write(cls, fobj, value, byteorder="big"):
+        fobj.write(int.to_bytes(value, cls._size, byteorder=byteorder, signed=False))
+
+class uint8(_uint):
+    _size = 1
+
+class uint16(_uint):
+    _size = 2
+
+class uint32(_uint):
+    _size = 4
+
+class uint64(_uint):
+    _size = 8
+
+class _bytes:
+
+    _size = None
+
+    @classmethod
+    def read(cls, fobj):
+        return safe_read(fobj, cls._size)
+
+    @classmethod
+    def write(cls, fobj, value):
+        assert len(value) == cls._size
+        fobj.write(value)
+
+class bytes4(_bytes):
+    _size = 4
+
+class bytes16(_bytes):
+    _size = 16
+
+class array(list):
+
+    @classmethod
+    def new(cls, _type, count):
+        return type(f"{_type.__name__}{count}", (cls,), {"_type": _type, "count": count,
+                                                         "size": _type._size * count})
+
+    @classmethod
+    def read(cls, fobj):
+        return cls(cls._type.read(fobj) for i in range(cls.count))
+
+    @classmethod
+    def write(cls, fobj, values):
+        assert isinstance(values, cls)
+        assert len(values) == cls.count
+        for value in values:
+            assert isinstance(value, cls._type)
+            cls._type.write(fobj, value)
+
+
+class _Structure:
+    """Represent a fixed-size structured binary buffer.
     """
     # pylint:disable=missing-function-docstring
 
-    def __init__(self, buf, offset=None):
-        self.buf = buf
+    _size = 0
+    _fields = []
+
+    def __init__(self, offset):
         self.offset = offset
-        self.parse()
+        self.buf = io.BytesIO()
+
+    @classmethod
+    def read(cls, fobj):
+        # FIXME
+        #size = 0
+        #for name, _type in self._fields:
+        #    size += _type._size
+        return cls.from_buf(fobj.tell(), safe_read(fobj, cls._size))
+
+    @classmethod
+    def from_buf(cls, offset, buf):
+        obj = cls(offset)
+        obj.buf.write(buf)
+        obj.buf.seek(0)
+        obj.parse()
+        return obj
 
     def parse(self):
-        """Parse the buffer structure.
-        """
-        raise NotImplementedError
+        for name, _type in self._fields:
+            if name is None and type(_type) is int:
+                self.buf.read(_type)
+            else:
+                value = _type.read(self.buf)
+                setattr(self, name, value)
 
-    def uint(self, offset, size, byteorder="big"):
-        """Read an integer at <offset> with a specified byte <size>.
-        """
-        return int.from_bytes(self.buf[offset:offset + size], byteorder=byteorder, signed=False)
-
-    def uint8(self, offset):
-        return self.uint(offset, 1)
-
-    def uint16(self, offset, byteorder="big"):
-        return self.uint(offset, 2, byteorder)
-
-    def uint32(self, offset):
-        return self.uint(offset, 4)
-
-    def uint64(self, offset):
-        return self.uint(offset, 8)
-
-    def bytes(self, offset, size):
-        return self.buf[offset:offset+size]
-
-    def bytes16(self, offset):
-        return self.bytes(offset, 16)
-
-    def array(self, offset, size, func, intsize):
-        a = []
-        for o in range(offset, offset + size * intsize, intsize):
-            a.append(func(o))
-        return a
+    def __repr__(self):
+        d = vars(self).copy()
+        del d["offset"]
+        del d["buf"]
+        return f"<{self.__class__.__name__} {d}>"
 
 
-class VMADeviceInfo(_StructParser):
+class VMADeviceInfo(_Structure):
     """Block device information structure.
     """
 
-    def parse(self):
-        self.devname_ptr = self.uint32(0)   # blob pointer to the device name
-        self.size = self.uint64(8)          # size of the device
+    _size = 32
+    _fields = [
+        ("devname_ptr", uint32),    # blob pointer to the device name
+        (None, 4),
+        ("size", uint64),           # size of the device
+        (None, 8),
+        (None, 8)
+    ]
 
 
-class VMAHeader(_StructParser):
+class VMAHeader(_Structure):
     """Global vma file header structure.
     """
 
-    def parse(self):
-        self.magic = self.bytes(0, 4)       # 'VMA\0'
-        self.version = self.uint32(4)       # version 1
-        self.uuid = self.bytes16(8)         # unique id, also used in extents
-        self.ctime = self.uint64(24)        # creation time
-        self.md5sum = self.bytes16(32)      # md5sum of the header
+    _size = VMA_HEADER_SIZE
+    _fields = [
+        ("magic", bytes4),          # 'VMA\0'
+        ("version", uint32),        # version 1
+        ("uuid", bytes16),          # unique id, also used in extents
+        ("ctime", uint64),          # creation time
+        ("md5sum", bytes16),        # md5sum of the header
 
-        self.blob_buffer_offset = self.uint32(48)   # start of the blob buffer
-        self.blob_buffer_size = self.uint32(52)     # size of the blob buffer
-        self.header_size = self.uint32(56)          # size of the header including the blob buffer
+        ("blob_buffer_offset", uint32),     # start of the blob buffer
+        ("blob_buffer_size", uint32),       # size of the blob buffer
+        ("header_size", uint32),            # size of the header including the blob buffer
 
-        self.config_names = self.array(2044, VMA_MAX_CONFIGS, self.uint32, 4)
+        (None, 1984),
+
+        ("config_names", array.new(uint32, VMA_MAX_CONFIGS)),
                                             # list of blob pointers to config file names
-        self.config_data = self.array(3068, VMA_MAX_CONFIGS, self.uint32, 4)
+        ("config_data", array.new(uint32, VMA_MAX_CONFIGS)),
                                             # list of blob pointers to config file data
-
-        self.dev_info = self.array(4096, 256, lambda o: VMADeviceInfo(self.buf[o:o+32], o), 32)
+        (None, 4),
+        ("dev_info", array.new(VMADeviceInfo, 256))
                                             # list of block device info structures
+    ]
+
+    def parse(self):
+        super().parse()
 
         if self.magic != b"VMA\0":
             raise SystemExit("ERROR: not a VMA file")
@@ -163,49 +248,61 @@ class VMAHeader(_StructParser):
         if self.version != 1:
             raise SystemExit("ERROR: only VMA version 1 is supported!")
 
-        if md5(self.buf[:32] + b"\0" * 16 + self.buf[48:]) != self.md5sum:
-            raise SystemExit(f"ERROR: corrupt file, damaged VMA header at 0x{self.offset:x}!")
+        #if md5(self.buf[:32] + b"\0" * 16 + self.buf[48:]) != self.md5sum:
+        #    raise SystemExit(f"ERROR: corrupt file, damaged VMA header at 0x{self.offset:x}!")
 
 
-class BlobBuffer(_StructParser, dict):
+class BlobBuffer(dict):
     """A dictionary holding the blobs.
     """
 
-    def parse(self):
-        offset = 1
-        while offset < len(self.buf):
-            size = self.uint16(offset, "little")
-            self[offset] = self.bytes(offset+2, size).rstrip(b"\0")
-            offset += 2 + size
+    @classmethod
+    def read(cls, fobj, _size):
+        obj = cls()
+        start = fobj.tell()
+        safe_read(fobj, 1) # skip the first byte
+        while (offset := fobj.tell() - start) < _size:
+            size = uint16.read(fobj, "little")
+            obj[offset] = bytes(safe_read(fobj, size)).rstrip(b"\0")
+        return obj
 
 
-class Blockinfo(_StructParser):
+class Blockinfo(_Structure):
     """Structure that holds information about one cluster of data in an extent header.
     """
 
-    def parse(self):
-        self.mask = self.uint16(0)          # bitmask 1-data 0-hole
-        self.dev_id = self.uint8(3)         # device id
-        self.cluster_num = self.uint32(4)   # position in the device file, in 65536-byte units
+    _size = 8
+    _fields = [
+        ("mask", uint16),       # bitmask 1-data 0-hole
+        (None, 1),
+        ("dev_id", uint8),      # device id
+        ("cluster_num", uint32) # position in the device file, in 65536-byte units
+    ]
 
 
-class VMAExtentHeader(_StructParser):
+class VMAExtentHeader(_Structure):
     """Extent header that contains up to 59 clusters with 16 4096-byte-blocks each.
     """
 
+    _size = VMA_EXTENT_HEADER_SIZE
+    _fields = [
+        ("magic", bytes4),          # 'VMAE'
+        (None, 2),
+        ("block_count", uint16),    # number of 4096-byte data blocks
+        ("uuid", bytes16),          # unique id, the same as in the global header
+        ("md5sum", bytes16),        # md5sum of the extent header
+        ("blockinfo", array.new(Blockinfo, VMA_BLOCKS_PER_EXTENT))
+                                    # table of up to 59 blockinfos
+    ]
+
     def parse(self):
-        self.magic = self.bytes(0, 4)       # 'VMAE'
-        self.block_count = self.uint16(6)   # number of 4096-byte data blocks
-        self.uuid = self.bytes16(8)         # unique id, the same as in the global header
-        self.md5sum = self.bytes16(24)      # md5sum of the extent header
-        self.blockinfo = self.array(40, VMA_BLOCKS_PER_EXTENT,
-                                    lambda o: Blockinfo(self.buf[o:o+8], o), 8)
-                                            # table of up to 59 blockinfos
+        super().parse()
 
         if self.magic != b"VMAE":
             raise SystemExit(f"ERROR: corrupt file, no VMA extent found at 0x{self.offset:x}!")
 
-        if md5(self.buf[:24] + b"\0" * 16 + self.buf[40:]) != self.md5sum:
+        buf = self.buf.getbuffer()
+        if md5(bytes(buf[:24]) + b"\0" * 16 + bytes(buf[40:])) != self.md5sum:
             raise SystemExit(f"ERROR: corrupt file, damaged VMA extent at 0x{self.offset:x}!")
 
 
@@ -257,18 +354,11 @@ class VMAReader:
     def __init__(self, fobj):
         self.fobj = fobj
 
-        self.header_data = self.fobj.read(VMA_HEADER_SIZE)
-        self.header = VMAHeader(self.header_data, 0)
+        self.header = VMAHeader.read(self.fobj)
 
-        if self.header.magic != b"VMA\0":
-            raise SystemExit("ERROR: not a VMA file")
+        assert self.fobj.tell() == self.header.blob_buffer_offset
 
-        if self.header.version != 1:
-            raise SystemExit("ERROR: only VMA version 1 is supported!")
-
-        self.fobj.seek(self.header.blob_buffer_offset)
-        self.blob_buffer_data = self.fobj.read(self.header.blob_buffer_size)
-        self.blob_buffer = BlobBuffer(self.blob_buffer_data, self.header.blob_buffer_offset)
+        self.blob_buffer = BlobBuffer.read(self.fobj, self.header.blob_buffer_size)
 
         self.configurations = {}
         for name_ptr, data_ptr in zip(self.header.config_names, self.header.config_data):
@@ -331,11 +421,14 @@ class VMAReader:
         counter = {dev_id: 0 for dev_id in self.devices}
         cluster_num = {}
         while True:
-            extent_data = self.fobj.read(VMA_EXTENT_HEADER_SIZE)
-            if not extent_data:
-                break
-
-            extent = VMAExtentHeader(extent_data, self.fobj.tell() - VMA_EXTENT_HEADER_SIZE)
+            offset = self.fobj.tell()
+            try:
+                extent = VMAExtentHeader.read(self.fobj)
+            except EOF as exc:
+                if exc.offset == offset:
+                    break
+                else:
+                    raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
 
             for blockinfo in extent.blockinfo:
                 dev_id = blockinfo.dev_id
@@ -346,7 +439,7 @@ class VMAReader:
                 mask = blockinfo.mask
                 for _ in range(16):
                     if mask & 1:
-                        self.fobj.read(4096)
+                        safe_read(self.fobj, 4096)
                     mask >>= 1
 
                 if blockinfo.cluster_num != cluster_num.get(dev_id, 0):
@@ -405,10 +498,14 @@ class VMAReader:
 
         total = os.fstat(self.fobj.fileno()).st_size
         while True:
-            extent_data = self.fobj.read(VMA_EXTENT_HEADER_SIZE)
-            if not extent_data:
-                break
-            extent = VMAExtentHeader(extent_data, self.fobj.tell() - VMA_EXTENT_HEADER_SIZE)
+            offset = self.fobj.tell()
+            try:
+                extent = VMAExtentHeader.read(self.fobj)
+            except EOF as exc:
+                if exc.offset == offset:
+                    break
+                else:
+                    raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
 
             for blockinfo in extent.blockinfo:
                 if blockinfo.dev_id not in devices:
@@ -419,7 +516,7 @@ class VMAReader:
                 mask = blockinfo.mask
                 for _ in range(16):
                     if mask & 1:
-                        dst.write(self.fobj.read(4096))
+                        dst.write(safe_read(self.fobj, 4096))
                     else:
                         dst.seek(4096, os.SEEK_CUR)
                     mask >>= 1
