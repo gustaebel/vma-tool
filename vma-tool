@@ -121,7 +121,7 @@ class _Structure:
         obj = cls.__new__(cls) # we don't call __init__()
         obj._offset = offset
         obj._buf = buf
-        obj.parse(cls._struct.unpack(buf))
+        obj.unpack(cls._struct.unpack(buf))
         return obj
 
     @classmethod
@@ -135,19 +135,19 @@ class _Structure:
             obj = cls.__new__(cls) # we don't call __init__()
             obj._offset = offset + o
             obj._buf = buf[o:o + cls._struct.size]
-            obj.parse(cls._struct.unpack(obj._buf))
+            obj.unpack(cls._struct.unpack(obj._buf))
             o += cls._struct.size
             a.append(obj)
         return a
 
     # FIXME name
-    def parse(self, record):
+    def unpack(self, record):
         """Initialize an instance from the values in <record>.
         """
         raise NotImplementedError
 
     # FIXME name
-    def render(self):
+    def pack(self):
         """Return a structured buffer representation of this instance.
         """
         raise NotImplementedError
@@ -165,10 +165,10 @@ class VMADeviceInfo(_Structure):
         self.devname_ptr = devname_ptr
         self.size = size
 
-    def parse(self, record):
+    def unpack(self, record):
         self.devname_ptr, self.size = record
 
-    def render(self):
+    def pack(self):
         return self._struct.pack(self.devname_ptr, self.size)
 
 
@@ -185,9 +185,9 @@ class VMAHeader(_Structure):
         self.ctime = ctime if ctime is not None else int(time.time())
 
         self.blob_buffer = BlobBuffer()
-        self.config_names = []
-        self.config_data = []
-        self.dev_info = [VMADeviceInfo(0, 0)]
+        self.configurations = {}
+        self.devices = {}
+        self.dev_id = 1
 
     @classmethod
     def read(cls, fobj):
@@ -197,7 +197,6 @@ class VMAHeader(_Structure):
 
         buf = safe_read(fobj, obj.header_size - obj.blob_buffer_offset)
         obj._buf += buf
-
         blob_buffer = BlobBuffer.from_buf(obj.blob_buffer_offset, buf[:obj.blob_buffer_size])
 
         obj.configurations = {}
@@ -220,7 +219,7 @@ class VMAHeader(_Structure):
 
         return obj
 
-    def parse(self, record):
+    def unpack(self, record):
         magic, version, self.uuid, self.ctime, self.md5sum, self.blob_buffer_offset, \
                 self.blob_buffer_size, self.header_size = record[:8]
 
@@ -239,27 +238,47 @@ class VMAHeader(_Structure):
     def add_config(self, name, data):
         """Add a configuration file to the blob buffer.
         """
-        self.config_names.append(self.blob_buffer.add_string(name))
-        self.config_data.append(self.blob_buffer.add_blob(data))
+        self.configurations[name] = data
 
     def add_device(self, name, size):
         """Add a device name to the blob buffer.
         """
-        self.dev_info.append(VMADeviceInfo(self.blob_buffer.add_string(name), size))
+        self.devices[self.dev_id] = (name, size)
+        self.dev_id += 1
 
-    def render(self):
-        self.config_names += [0] * (VMA_MAX_CONFIGS - len(self.config_names))
-        self.config_data += [0] * (VMA_MAX_CONFIGS - len(self.config_data))
+    def pack(self):
+        config_names = []
+        config_data = []
+        configurations = self.configurations.copy()
 
-        self.dev_info += [VMADeviceInfo(0, 0)] * (VMA_MAX_DEVICES - len(self.dev_info))
-        dev_info_buf = b"".join(d.render() for d in self.dev_info)
+        for i in range(VMA_MAX_CONFIGS):
+            try:
+                name, data = configurations.popitem()
+            except KeyError:
+                config_names.append(0)
+                config_data.append(0)
+            else:
+                config_names.append(self.blob_buffer.add_string(name))
+                config_data.append(self.blob_buffer.add_blob(data))
+
+        dev_info = []
+        devices = sorted(self.devices.items())
+        for i in range(VMA_MAX_DEVICES):
+            try:
+                dev_id, (name, size) = devices.pop()
+            except IndexError:
+                dev_info.append(VMADeviceInfo(0, 0))
+            else:
+                dev_info.append(VMADeviceInfo(self.blob_buffer.add_string(name), size))
+
+        dev_info_buf = b"".join(d.pack() for d in dev_info)
 
         self._buf.write(self._struct.pack(b"VMA\0", 1, self.uuid, self.ctime, b"\0" * 16,
                                           VMA_HEADER_SIZE, self.blob_buffer.size,
                                           VMA_HEADER_SIZE + block512(self.blob_buffer.size),
-                                          *self.config_names, *self.config_data, dev_info_buf))
+                                          *config_names, *config_data, dev_info_buf))
 
-        self._buf.write(self.blob_buffer.render())
+        self._buf.write(self.blob_buffer.pack())
 
         buf = self._buf.getbuffer()
         buf[32:48] = md5(buf)
@@ -316,7 +335,7 @@ class BlobBuffer(dict):
         self._buf.write(s)
         return offset
 
-    def render(self):
+    def pack(self):
         """Return a structured buffer representation of this instance.
         """
         buf = self._buf.getvalue()
@@ -338,7 +357,7 @@ class Blockinfo(_Structure):
 
         self.blocks = []
 
-    def parse(self, record):
+    def unpack(self, record):
         self.mask, self.dev_id, self.cluster_num = record
 
     def iterate(self, fobj):
@@ -371,7 +390,7 @@ class Blockinfo(_Structure):
 
         return len(self.blocks)
 
-    def render(self):
+    def pack(self):
         return self._struct.pack(self.mask, self.dev_id, self.cluster_num)
 
 
@@ -381,7 +400,7 @@ class VMAExtentHeader(_Structure):
 
     _struct = Struct("> 4s 2x H 16s 16s 472s")
 
-    def parse(self, record):
+    def unpack(self, record):
         magic, self.block_count, self.uuid, self.md5sum, blockinfo_buf = record
 
         if magic != b"VMAE":
@@ -411,7 +430,7 @@ class VMAExtentHeader(_Structure):
         self.blockinfos.append(blockinfo)
         return len(self.blockinfos) == VMA_BLOCKS_PER_EXTENT
 
-    def render(self):
+    def pack(self):
         # If there is no data, we do not need a VMA extent.
         if not self.blockinfos:
             return b""
@@ -425,7 +444,7 @@ class VMAExtentHeader(_Structure):
                 # pylint:disable=protected-access
                 blockinfo_buf.write(b"\0" * Blockinfo._struct.size)
             else:
-                blockinfo_buf.write(blockinfo.render())
+                blockinfo_buf.write(blockinfo.pack())
 
         # Build the header structure.
         self._buf.write(self._struct.pack(b"VMAE", self.block_count, self.uuid, b"\0" * 16,
@@ -689,7 +708,7 @@ class Main:
             print("  working directory:", os.path.abspath(source))
 
         with open(self.args.destination + ".tmp", "wb") as dst:
-            writer = VMAHeader(uuid, ctime)
+            vma_header = VMAHeader(uuid, ctime)
 
             names = sorted(os.listdir(source))
 
@@ -715,7 +734,7 @@ class Main:
                                     print(f"  ERROR: unable to update non-standard key {key!r}")
                         config = config.getvalue()
                     name = os.fsencode(name)
-                    writer.add_config(name, config)
+                    vma_header.add_config(name, config)
 
             # Store device name blobs.
             total = 0
@@ -725,10 +744,10 @@ class Main:
 
                 path = os.path.join(source, name)
                 size = os.path.getsize(path)
-                writer.add_device(os.fsencode(name), size)
+                vma_header.add_device(os.fsencode(name), size)
                 total += size
 
-            dst.write(writer.render())
+            dst.write(vma_header.pack())
 
             # Store device files.
             dev_id = 1
@@ -742,7 +761,7 @@ class Main:
                     print("\r  pack device", name)
 
                 with open(path, "rb") as src:
-                    extent = VMAExtentHeader(dev_id, writer.uuid, 0)
+                    extent = VMAExtentHeader(dev_id, uuid, 0)
                     while True:
                         cluster = src.read(VMA_CLUSTER_SIZE)
                         if not cluster:
@@ -754,10 +773,10 @@ class Main:
                                   file=sys.stderr, flush=True)
 
                         if extent.add(cluster):
-                            dst.write(extent.render())
-                            extent = VMAExtentHeader(dev_id, writer.uuid, extent.cluster_num)
+                            dst.write(extent.pack())
+                            extent = VMAExtentHeader(dev_id, uuid, extent.cluster_num)
 
-                    dst.write(extent.render())
+                    dst.write(extent.pack())
 
                 dev_id += 1
 
