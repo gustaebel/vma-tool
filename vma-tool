@@ -100,6 +100,9 @@ class _Structure:
 
     _struct = Struct("")
 
+    def __init__(self):
+        self._buf = io.BytesIO() # FIXME this is overwritten in from_buf() when parsing
+
     @classmethod
     def read(cls, fobj):
         return cls.from_buf(fobj.tell(), safe_read(fobj, cls._struct.size))
@@ -202,6 +205,13 @@ class BlobBuffer(dict):
 
     _struct = Struct("<H")
 
+    def __init__(self):
+        self._buf = io.BytesIO()
+
+    @property
+    def size(self):
+        return self._buf.tell()
+
     @classmethod
     def from_buf(cls, offset, buf):
         obj = cls()
@@ -216,6 +226,28 @@ class BlobBuffer(dict):
             o += s + size
         return obj
 
+    def add_string(self, s):
+        """Add a null-terminated string to the blob buffer.
+        """
+        return self.add_blob(s + b"\0")
+
+    def add_blob(self, s):
+        """Add raw data to the blob buffer.
+        """
+        offset = self._buf.tell()
+        if offset == 0:
+            # There is one null-byte padding at the start of the blob buffer.
+            self._buf.write(b"\0")
+            offset = 1
+
+        self._buf.write(self._struct.pack(len(s)))
+        self._buf.write(s)
+        return offset
+
+    def render(self): # FIXME name?
+        buf = self._buf.getvalue()
+        return buf + b"\0" * (block512(len(buf)) - len(buf))
+
 
 class Blockinfo(_Structure):
     """Structure that holds information about one cluster of data in an extent header.
@@ -225,6 +257,43 @@ class Blockinfo(_Structure):
 
     def parse(self, record):
         self.mask, self.dev_id, self.cluster_num = record
+
+    def iterate(self, fobj):
+        mask = self.mask
+        for _ in range(16):
+            if mask & 1:
+                yield safe_read(fobj, 4096)
+            else:
+                yield None
+            mask >>= 1
+
+    def add(self, dev_id, cluster_num, cluster):
+        """Store a cluster of blocks.
+        """
+        self.mask = 0
+        self.dev_id = dev_id
+        self.cluster_num = cluster_num
+
+        self.blocks = []
+
+        for i in range(16):
+            offset = i * 4096
+            block = cluster[offset:offset+4096]
+
+            if not block:
+                # If a file does not line up to 65536 bytes,
+                # we add "holes" at the end.
+                block = b"\0" * 4096
+
+            self.mask >>= 1
+            if block.count(b"\0") != 4096:
+                self.mask |= 1 << 15
+                self.blocks.append(block)
+
+        return len(self.blocks)
+
+    def render(self):
+        return self._struct.pack(self.mask, self.dev_id, self.cluster_num)
 
 
 class VMAExtentHeader(_Structure):
@@ -353,11 +422,8 @@ class VMAReader:
                 if dev_id not in self.header.devices:
                     continue
 
-                mask = blockinfo.mask
-                for _ in range(16):
-                    if mask & 1:
-                        safe_read(self.fobj, 4096)
-                    mask >>= 1
+                for buf in blockinfo.iterate(self.fobj):
+                    pass
 
                 if blockinfo.cluster_num != cluster_num.get(dev_id, 0):
                     counter[dev_id] += 1
@@ -428,13 +494,12 @@ class VMAReader:
 
                 dst = devices[blockinfo.dev_id]
                 dst.seek(blockinfo.cluster_num * VMA_CLUSTER_SIZE)
-                mask = blockinfo.mask
-                for _ in range(16):
-                    if mask & 1:
-                        dst.write(safe_read(self.fobj, 4096))
+
+                for buf in blockinfo.iterate(self.fobj):
+                    if buf is not None:
+                        dst.write(buf)
                     else:
                         dst.seek(4096, os.SEEK_CUR)
-                    mask >>= 1
 
                 if progress:
                     pos = self.fobj.tell()
@@ -484,33 +549,6 @@ class _StructBuilder:
         self.write(int.to_bytes(v, 8))
 
 
-class BlobBufferBuilder(_StructBuilder):
-    """Assemble the blob buffer that contains configuration names and data
-       and device names.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.write(b"\0")
-
-    def add_string(self, s):
-        """Add a null-terminated string to the blob buffer.
-        """
-        return self.add_blob(s + b"\0")
-
-    def add_blob(self, s):
-        """Add raw data to the blob buffer.
-        """
-        offset = self.size
-        self.uint16(len(s), "little")
-        self.write(s)
-        return offset
-
-    def render(self):
-        buf = self.buffer.getvalue()
-        return buf + b"\0" * (block512(len(buf)) - len(buf))
-
-
 class VMABuilder(_StructBuilder):
     """Build the header structure for a Proxmox VMA file.
     """
@@ -521,7 +559,7 @@ class VMABuilder(_StructBuilder):
         self.uuid = uuid
         self.ctime = ctime if ctime is not None else int(time.time())
 
-        self.blob_buffer = BlobBufferBuilder()
+        self.blob_buffer = BlobBuffer()
         self.config_names = []
         self.config_data = []
         self.dev_info = [(0, 0)]
@@ -584,30 +622,6 @@ class VMABuilder(_StructBuilder):
         return self.buffer.getvalue()
 
 
-class BlockinfoBuilder:
-    """Structure that holds information about one cluster of data in an extent header.
-    """
-    # pylint:disable=too-few-public-methods
-
-    def __init__(self, cluster_num):
-        self.cluster_num = cluster_num
-        self.mask = 0
-        self.blocks = []
-
-    def add(self, block):
-        """Add a block of data to the cluster.
-        """
-        if not block:
-            # If a file does not line up to 65536 bytes,
-            # we add "holes" at the end.
-            block = b"\0" * 4096
-
-        self.mask >>= 1
-        if block.count(b"\0") != 4096:
-            self.mask |= 1 << 15
-            self.blocks.append(block)
-
-
 class VMAExtentBuilder(_StructBuilder):
     """Extent header that contains structured block device file data.
     """
@@ -622,17 +636,12 @@ class VMAExtentBuilder(_StructBuilder):
         self.block_count = 0
         self.blockinfos = []
 
-    def add(self, block):
+    def add(self, cluster):
         """Add a cluster of data to the extent.
         """
-        blockinfo = BlockinfoBuilder(self.cluster_num)
+        blockinfo = Blockinfo()
+        self.block_count += blockinfo.add(self.dev_id, self.cluster_num, cluster)
         self.cluster_num += 1
-
-        for i in range(16):
-            offset = i * 4096
-            blockinfo.add(block[offset:offset+4096])
-
-        self.block_count += len(blockinfo.blocks)
         self.blockinfos.append(blockinfo)
         return len(self.blockinfos) == VMA_BLOCKS_PER_EXTENT
 
@@ -649,11 +658,9 @@ class VMAExtentBuilder(_StructBuilder):
             try:
                 blockinfo = self.blockinfos[i]
             except IndexError:
-                self.uint64(0)
+                self.buffer.write(b"\0" * Blockinfo._struct.size)
             else:
-                self.uint16(blockinfo.mask)
-                self.uint16(self.dev_id)
-                self.uint32(blockinfo.cluster_num)
+                self.buffer.write(blockinfo.render())
 
         buf = self.buffer.getbuffer()
         buf[24:40] = md5(buf)
