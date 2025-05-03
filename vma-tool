@@ -30,6 +30,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # pylint:disable=invalid-name,too-many-instance-attributes,attribute-defined-outside-init
+# pylint:disable=no-else-break,no-else-continue
 
 """Manage and optimize Proxmox VMA (virtual machine archive) files.
 """
@@ -40,7 +41,6 @@ import sys
 import time
 import hashlib
 import argparse
-import tempfile
 
 from struct import Struct
 from uuid import UUID, uuid4
@@ -122,6 +122,8 @@ class _Structure:
 
     @classmethod
     def read_array(cls, fobj, count):
+        """Read an array of length <count>.
+        """
         a = []
         for _ in range(count):
             a.append(cls.read(fobj))
@@ -227,7 +229,7 @@ class VMAHeader(_Structure):
         config_data = []
         configurations = self.configurations.copy()
 
-        for i in range(VMA_MAX_CONFIGS):
+        for _ in range(VMA_MAX_CONFIGS):
             try:
                 name, data = configurations.popitem()
             except KeyError:
@@ -265,7 +267,7 @@ class VMAHeader(_Structure):
 
 
 class BlobBuffer(dict):
-    """A dictionary holding the blobs.
+    """A dictionary holding the blobs with a variable-size binary representation.
     """
 
     _struct = Struct("<H")
@@ -281,6 +283,8 @@ class BlobBuffer(dict):
 
     @classmethod
     def read(cls, fobj, size):
+        """Read a complete blob buffer structure from <fobj>.
+        """
         offset = fobj.tell()
         buf = safe_read(fobj, size)
 
@@ -603,7 +607,8 @@ class VMAReader:
             try:
                 cache[dev_id][blockinfo.cluster_num] = blockinfo
             except KeyError:
-                raise SystemExit(f"ERROR: found cluster for device {dev_id} in device {cur_dev_id}!")
+                raise SystemExit(f"ERROR: found cluster for device {dev_id} too far in the area "\
+                        f"of device {cur_dev_id}!")
 
             # Yield all clusters from the cache that are in the right order.
             while cache[cur_dev_id] and cluster_num[cur_dev_id] in cache[cur_dev_id]:
@@ -616,6 +621,7 @@ class VMAReader:
                 if d == cur_dev_id:
                     continue
                 if len(c) >= threshold and not cache[cur_dev_id]:
+                    # Mark the device as completed by removing the cache and switch to the next.
                     del cache[cur_dev_id]
                     cur_dev_id = d
                     break
@@ -675,22 +681,18 @@ class VMAReader:
 
         devices = {}
         sizes = {}
-        try:
-            for dev_id, (name, size) in self.header.devices.items():
-                path = os.path.join(directory, name)
-                devices[dev_id] = open(path + ".tmp", "wb")
-                sizes[dev_id] = size
-                if verbose:
-                    print(f"  extract device {dev_id} ({format_size(size)})", name)
+        for dev_id, (name, size) in self.header.devices.items():
+            path = os.path.join(directory, name)
+            devices[dev_id] = open(path + ".tmp", "wb")
+            sizes[dev_id] = size
+            if verbose:
+                print(f"  extract device {dev_id} ({format_size(size)})", name)
 
-            self.extract_devices(devices, sizes, progress)
+        self.extract_devices(devices, sizes, progress)
 
-        except:
-            raise
-        else:
-            for dst in devices.values():
-                dst.close()
-                os.rename(dst.name, os.path.splitext(dst.name)[0])
+        for dst in devices.values():
+            dst.close()
+            os.rename(dst.name, os.path.splitext(dst.name)[0])
 
     def extract_devices(self, devices, sizes, progress):
         """Iterate through the VMA file extents and extract the data for all block devices
