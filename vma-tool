@@ -756,92 +756,101 @@ class Main:
     def pack(self):
         """Pack the contents of a directory in a VMA file.
         """
-        self._pack(self.args.source, OPTIMIZED_UUID if self.args.optimize else uuid4().bytes, None)
+        uuid = OPTIMIZED_UUID if self.args.optimize else uuid4().bytes
 
-    def _pack(self, source, uuid, ctime):
         if self.args.verbose:
             print("write", self.args.destination)
 
         with open(self.args.destination + ".tmp", "wb") as dst:
-            vma_header = VMAHeader(uuid, ctime)
+            vma_header = VMAHeader(uuid, None)
+            self.pack_configuration(dst, vma_header)
+            self.pack_devices(dst, vma_header)
 
-            names = sorted(os.listdir(source))
 
-            # Store configuration file blobs.
-            for name in names:
-                if name.startswith("drive-"):
-                    continue
+        os.rename(self.args.destination + ".tmp", self.args.destination)
 
-                path = os.path.join(source, name)
-                if self.args.verbose:
-                    print("  pack config", name)
+    def pack_configuration(self, dst, vma_header):
+        """Store the VM and firewall configuration.
+        """
+        path = os.path.join(self.args.source, "qemu-server.conf")
+        if self.args.verbose:
+            print("  pack", path)
 
-                with open(path, "rb") as src:
-                    config = src.read()
-                    if name == "qemu-server.conf" and self.args.update:
-                        config = Config(config)
-                        for key, value in self.args.update:
-                            if config.set(key, value):
-                                if self.args.verbose:
-                                    print(f"  update {key}={value}")
-                            else:
-                                if self.args.verbose:
-                                    print(f"  ERROR: unable to update non-standard key {key!r}")
-                        config = config.getvalue()
-                    name = os.fsencode(name)
-                    vma_header.add_config(name, config)
+        with open(path, "rb") as fobj:
+            config = Config(fobj.read())
+            for key, value in self.args.update:
+                if config.set(key, value):
+                    if self.args.verbose:
+                        print(f"  update {key}={value}")
+                else:
+                    if self.args.verbose:
+                        print(f"  ERROR: unable to update non-standard key {key!r}")
 
-            # Store device name blobs.
-            total = 0
-            for name in names:
-                if not name.startswith("drive-"):
-                    continue
+            vma_header.add_config(b"qemu-server.conf", config.getvalue())
 
-                path = os.path.join(source, name)
+        # Store firewall rules.
+        path = os.path.join(self.args.source, "qemu-server.fw")
+        if os.path.exists(path):
+            if self.args.verbose:
+                print("  pack", path)
+
+            with open(path, "rb") as fobj:
+                vma_header.add_config(b"qemu-server.fw", fobj.read())
+
+    def pack_device_names(self, dst, vma_header):
+        """Store device names in the blob buffer.
+        """
+        # We don't actually parse the config file to make sure that all referenced devices are
+        # stored.
+        total = 0
+        device_paths = []
+        for name in sorted(os.listdir(self.args.source)):
+            if name.startswith("drive-"):
+                path = os.path.join(self.args.source, name)
                 size = os.path.getsize(path)
                 vma_header.add_device(os.fsencode(name), size)
                 total += size
+                device_paths.append((name, path))
 
-            dst.write(vma_header.pack())
+        dst.write(vma_header.pack())
+        return device_paths, total
 
-            # Store device files.
-            dev_id = 1
+    def pack_devices(self, dst, vma_header):
+        """Store device data in data extents.
+        """
+        device_paths, total = self.pack_device_names(dst, vma_header)
+
+        dev_id = 1
+        cluster_num = 0
+        pos = 0
+        for name, path in device_paths:
+            if self.args.verbose:
+                print("\r  pack device", name)
+
+            with open(path, "rb") as src:
+                extent = VMAExtentHeader(vma_header.uuid)
+                while True:
+                    cluster = src.read(VMA_CLUSTER_SIZE)
+                    if not cluster:
+                        break
+
+                    pos += VMA_CLUSTER_SIZE
+                    if self.args.progress:
+                        print(f"\r  progress: {pos / total * 100:.1f}% ", end="",
+                              file=sys.stderr, flush=True)
+
+                    if extent.add(dev_id, cluster_num, cluster):
+                        dst.write(extent.pack())
+                        extent = VMAExtentHeader(vma_header.uuid)
+                    cluster_num += 1
+
+                dst.write(extent.pack())
+
+            dev_id += 1
             cluster_num = 0
-            pos = 0
-            for name in names:
-                if not name.startswith("drive-"):
-                    continue
 
-                path = os.path.join(source, name)
-                if self.args.verbose:
-                    print("\r  pack device", name)
-
-                with open(path, "rb") as src:
-                    extent = VMAExtentHeader(uuid)
-                    while True:
-                        cluster = src.read(VMA_CLUSTER_SIZE)
-                        if not cluster:
-                            break
-
-                        pos += VMA_CLUSTER_SIZE
-                        if self.args.progress:
-                            print(f"\r  progress: {pos / total * 100:.1f}% ", end="",
-                                  file=sys.stderr, flush=True)
-
-                        if extent.add(dev_id, cluster_num, cluster):
-                            dst.write(extent.pack())
-                            extent = VMAExtentHeader(uuid)
-                        cluster_num += 1
-
-                    dst.write(extent.pack())
-
-                dev_id += 1
-                cluster_num = 0
-
-            if self.args.progress:
-                print(file=sys.stderr)
-
-        os.rename(self.args.destination + ".tmp", self.args.destination)
+        if self.args.progress:
+            print(file=sys.stderr)
 
     def optimize(self):
         """Unpack and repack a VMA file.
@@ -912,7 +921,7 @@ def parse_arguments():
     pack_parser.add_argument("-P", "--no-progress", action="store_false", dest="progress",
                              help="suppress progress output")
     pack_parser.add_argument("-u", "--update", action="append", type=lambda s: split(s, "="),
-                             help="update configuration entries, e.g. -u name=foobar")
+                             default=(), help="update configuration entries, e.g. -u name=foobar")
     pack_parser.add_argument("-O", "--optimize", action="store_true", default=False,
                              help="optimize for better deduplication")
     pack_parser.add_argument("source", help="a directory with configuration and device files")
@@ -925,8 +934,8 @@ def parse_arguments():
                                  default=True, help="suppress informational output")
     optimize_parser.add_argument("-P", "--no-progress", action="store_false", dest="progress",
                                  help="suppress progress output")
-    optimize_parser.add_argument("-u", "--update", action="append",
-                                 type=lambda s: split(s, "="),
+    optimize_parser.add_argument("-u", "--update", action="append", type=lambda s: split(s, "="),
+                                 default=(),
                                  help="update configuration entries, e.g. -u name=foobar")
     optimize_parser.add_argument("source", help="the vma file to read")
     optimize_parser.add_argument("destination", nargs="?",
