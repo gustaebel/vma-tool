@@ -2,6 +2,14 @@
 
 Optimize and manage VMA (virtual machine archive) files created by Proxmox backup.
 
+> [!WARNING]
+> *vma-tool* is in the early stages of development. Use at your own risk! VMA
+> files written with *vma-tool* may no longer be readable by Proxmox backup.
+> Always check the results of *vma-tool*:
+> ```sh
+> vma verify -v test.vma
+> ```
+
 
 ## VMA backups don't dedup well
 
