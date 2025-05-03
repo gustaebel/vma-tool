@@ -45,6 +45,8 @@ import argparse
 from struct import Struct
 from uuid import UUID, uuid4
 
+__version__ = "0.2"
+
 OPTIMIZED_UUID = bytes.fromhex("12345678aabbccddeeffaabbccddeeff")
 ZERO_BLOCK = b"\0" * 4096
 
