@@ -28,9 +28,9 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
+#
 # pylint:disable=invalid-name,too-many-instance-attributes,attribute-defined-outside-init
-# pylint:disable=no-else-break,no-else-continue,no-else-raise
+# pylint:disable=no-else-break,no-else-continue,no-else-raise,too-many-lines
 
 """Manage and optimize Proxmox VMA (virtual machine archive) files.
 """
@@ -179,6 +179,8 @@ class VMAHeader(_Structure):
         self.dev_id = 1
 
     def get_total_from_devinfos(self):
+        """Calculate the total size of all stored devices for progress diplay.
+        """
         assert bool(self.devices)
         return sum(t[1] for t in self.devices.values())
 
