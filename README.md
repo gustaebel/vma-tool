@@ -78,6 +78,10 @@ optimized version.
 vma-tool unpack source.vma destination/
 ```
 
+```sh
+zstdcat source.vma.zst | vma-tool unpack - destination/
+```
+
 #### Pack a VMA file
 
 ```sh

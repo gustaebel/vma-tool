@@ -30,7 +30,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # pylint:disable=invalid-name,too-many-instance-attributes,attribute-defined-outside-init
-# pylint:disable=no-else-break,no-else-continue
+# pylint:disable=no-else-break,no-else-continue,no-else-raise
 
 """Manage and optimize Proxmox VMA (virtual machine archive) files.
 """
@@ -177,6 +177,10 @@ class VMAHeader(_Structure):
         self.configurations = {}
         self.devices = {}
         self.dev_id = 1
+
+    def get_total_from_devinfos(self):
+        assert bool(self.devices)
+        return sum(t[1] for t in self.devices.values())
 
     def unpack(self, fobj, record):
         # pylint:disable=protected-access
@@ -519,7 +523,8 @@ class VMAReader:
         print("filename:", self.fobj.name)
         print("uuid:", UUID(bytes=self.header.uuid))
         print("created:", time.asctime(time.localtime(self.header.ctime)))
-        print("size:", format_size(os.fstat(self.fobj.fileno()).st_size))
+        if self.fobj.fileno() is not None:
+            print("size:", format_size(os.fstat(self.fobj.fileno()).st_size))
 
         for name, config in self.header.configurations.items():
             if name == "qemu-server.conf":
@@ -551,9 +556,10 @@ class VMAReader:
         """Generate Blockinfo objects for all device ids in the order they are stored.
         """
         if progress:
-            total = os.fstat(self.fobj.fileno()).st_size
+            total = self.header.get_total_from_devinfos()
 
         seen = set()
+        pos = 0
         while True:
             offset = self.fobj.tell()
             try:
@@ -568,15 +574,16 @@ class VMAReader:
                 if blockinfo.dev_id > 0:
                     key = (blockinfo.dev_id, blockinfo.cluster_num)
                     if key in seen:
-                        print(f"ERROR: found duplicate cluster {key!r}!")
+                        raise SystemExit(f"ERROR: found duplicate cluster {key!r}!")
                     else:
                         seen.add(key)
 
                     blockinfo.read_blocks(self.fobj)
                     yield blockinfo
+                    pos += VMA_CLUSTER_SIZE
 
             if progress:
-                print(f"\r  progress: {offset / total * 100:.1f}% ", end="", file=sys.stderr,
+                print(f"\r  progress: {pos / total * 100:.1f}% ", end="", file=sys.stderr,
                       flush=True)
 
         if progress:
@@ -679,7 +686,7 @@ class VMAReader:
         for name, config in self.header.configurations.items():
             path = os.path.join(directory, name)
             if verbose:
-                print("  extract config", name)
+                print("  extract config", name, file=sys.stderr)
             with open(path + ".tmp", "wb") as dst:
                 dst.write(config)
             os.rename(path + ".tmp", path)
@@ -691,7 +698,7 @@ class VMAReader:
             devices[dev_id] = open(path + ".tmp", "wb")
             sizes[dev_id] = size
             if verbose:
-                print(f"  extract device {dev_id} ({format_size(size)})", name)
+                print(f"  extract device {dev_id} ({format_size(size)})", name, file=sys.stderr)
 
         self.extract_devices(devices, sizes, progress)
 
@@ -720,6 +727,78 @@ class VMAReader:
             os.truncate(dst.fileno(), size)
 
 
+class InputFile:
+    """Minimal file object wrapper that supports tell() for stdin.
+    """
+    # pylint:disable=missing-docstring
+
+    def __init__(self, name, verbose):
+        self.offset = 0
+        self.name = "<stdin>" if name == "-" else name
+        self.verbose = verbose
+
+    def tell(self):
+        return self.offset
+
+    def fileno(self):
+        return self.src.fileno() if self.name != "<stdin>" else None
+
+    def read(self, n):
+        buf = self.src.read(n)
+        self.offset += len(buf)
+        return buf
+
+    def __enter__(self):
+        if self.name == "<stdin>":
+            if self.verbose:
+                print("read from stdin", file=sys.stderr)
+            self.src = sys.stdin.buffer
+            self._close = False
+        else:
+            if self.verbose:
+                print("read", self.name, file=sys.stderr)
+            self.src = open(self.name, "rb")
+            self._close = True
+        return self
+
+    def __exit__(self, *exc):
+        if self._close:
+            self.src.close()
+
+
+class OutputFile:
+    """Minimal file object wrapper.
+    """
+    # pylint:disable=missing-docstring
+
+    def __init__(self, name, verbose):
+        self.offset = 0
+        self.name = name
+        self.verbose = verbose
+
+    def write(self, buf):
+        self.dst.write(buf)
+
+    def __enter__(self):
+        if self.name == "-":
+            self.dst = sys.stdout.buffer
+            if self.verbose:
+                print("write to stdout", file=sys.stderr)
+            self._close = False
+        else:
+            self.dst = open(self.name + ".tmp", "wb")
+            if self.verbose:
+                print("write", self.name, file=sys.stderr)
+            self._close = True
+
+        return self
+
+    def __exit__(self, *exc):
+        if not exc and self._close:
+            self.dst.close()
+            os.rename(self.name + ".tmp", self.name)
+
+
 class Main:
     """Parse command line arguments and run the specified action.
     """
@@ -735,100 +814,90 @@ class Main:
     def info(self):
         """Show detailed information about a VMA file.
         """
-        with open(self.args.source, "rb") as src:
+        with InputFile(self.args.source, self.args.verbose) as src:
             reader = VMAReader(src)
             reader.info()
 
     def unpack(self):
         """Unpack the contents of a VMA file to a directory.
         """
-        self._unpack(self.args.destination)
-
-    def _unpack(self, destination):
-        if self.args.verbose:
-            print("read", self.args.source)
-
-        with open(self.args.source, "rb") as src:
+        # pylint:disable=consider-using-with
+        with InputFile(self.args.source, self.args.verbose) as src:
             reader = VMAReader(src)
-            reader.unpack(destination, self.args.verbose, self.args.progress)
+            reader.unpack(self.args.destination, self.args.verbose, self.args.progress)
         return reader.header.uuid, reader.header.ctime
 
     def pack(self):
         """Pack the contents of a directory in a VMA file.
         """
+        # pylint:disable=consider-using-with
         uuid = OPTIMIZED_UUID if self.args.optimize else uuid4().bytes
 
-        if self.args.verbose:
-            print("write", self.args.destination)
+        with OutputFile(self.args.destination, self.args.verbose) as dst:
+            header = VMAHeader(uuid, None)
+            self.pack_configuration(header)
+            self.pack_devices(dst, header)
 
-        with open(self.args.destination + ".tmp", "wb") as dst:
-            vma_header = VMAHeader(uuid, None)
-            self.pack_configuration(dst, vma_header)
-            self.pack_devices(dst, vma_header)
-
-
-        os.rename(self.args.destination + ".tmp", self.args.destination)
-
-    def pack_configuration(self, dst, vma_header):
+    def pack_configuration(self, header):
         """Store the VM and firewall configuration.
         """
         path = os.path.join(self.args.source, "qemu-server.conf")
         if self.args.verbose:
-            print("  pack", path)
+            print("  pack", path, file=sys.stderr)
 
         with open(path, "rb") as fobj:
             config = Config(fobj.read())
             for key, value in self.args.update:
                 if config.set(key, value):
                     if self.args.verbose:
-                        print(f"  update {key}={value}")
+                        print(f"  update {key}={value}", file=sys.stderr)
                 else:
                     if self.args.verbose:
-                        print(f"  ERROR: unable to update non-standard key {key!r}")
+                        print(f"  WARNING: unable to update non-standard key {key!r}",
+                              file=sys.stderr)
 
-            vma_header.add_config(b"qemu-server.conf", config.getvalue())
+            header.add_config(b"qemu-server.conf", config.getvalue())
 
         # Store firewall rules.
         path = os.path.join(self.args.source, "qemu-server.fw")
         if os.path.exists(path):
             if self.args.verbose:
-                print("  pack", path)
+                print("  pack", path, file=sys.stderr)
 
             with open(path, "rb") as fobj:
-                vma_header.add_config(b"qemu-server.fw", fobj.read())
+                header.add_config(b"qemu-server.fw", fobj.read())
 
-    def pack_device_names(self, dst, vma_header):
+    def pack_device_names(self, dst, header):
         """Store device names in the blob buffer.
         """
         # We don't actually parse the config file to make sure that all referenced devices are
         # stored.
-        total = 0
         device_paths = []
         for name in sorted(os.listdir(self.args.source)):
             if name.startswith("drive-"):
                 path = os.path.join(self.args.source, name)
                 size = os.path.getsize(path)
-                vma_header.add_device(os.fsencode(name), size)
-                total += size
+                header.add_device(os.fsencode(name), size)
                 device_paths.append((name, path))
 
-        dst.write(vma_header.pack())
-        return device_paths, total
+        dst.write(header.pack())
+        return device_paths
 
-    def pack_devices(self, dst, vma_header):
+    def pack_devices(self, dst, header):
         """Store device data in data extents.
         """
-        device_paths, total = self.pack_device_names(dst, vma_header)
+        device_paths = self.pack_device_names(dst, header)
+        total = header.get_total_from_devinfos()
 
         dev_id = 1
         cluster_num = 0
         pos = 0
         for name, path in device_paths:
             if self.args.verbose:
-                print("\r  pack device", name)
+                print("\r  pack device", name, file=sys.stderr)
 
             with open(path, "rb") as src:
-                extent = VMAExtentHeader(vma_header.uuid)
+                extent = VMAExtentHeader(header.uuid)
                 while True:
                     cluster = src.read(VMA_CLUSTER_SIZE)
                     if not cluster:
@@ -841,7 +910,7 @@ class Main:
 
                     if extent.add(dev_id, cluster_num, cluster):
                         dst.write(extent.pack())
-                        extent = VMAExtentHeader(vma_header.uuid)
+                        extent = VMAExtentHeader(header.uuid)
                     cluster_num += 1
 
                 dst.write(extent.pack())
@@ -858,23 +927,28 @@ class Main:
         if self.args.destination is None:
             self.args.destination = self.args.source
             if self.args.verbose:
-                print(f"INFO: optimize {self.args.destination} in-place")
+                print(f"INFO: optimize {self.args.destination} in-place", file=sys.stderr)
 
-        if self.args.verbose:
-            print("read", self.args.source)
-
-        with open(self.args.source, "rb") as src:
+        with InputFile(self.args.source, self.args.verbose) as src:
             reader = VMAReader(src)
             if reader.header.uuid == OPTIMIZED_UUID:
                 if self.args.verbose:
-                    print("  INFO: archive is already optimized")
+                    print("  INFO: archive is already optimized", file=sys.stderr)
                 sys.exit(0)
 
-            with open(self.args.destination + ".tmp", "wb") as dst:
-                vma_header = VMAHeader(OPTIMIZED_UUID, reader.header.ctime)
-                vma_header.configurations = reader.header.configurations
-                vma_header.devices = reader.header.devices
-                dst.write(vma_header.pack())
+            header = VMAHeader(OPTIMIZED_UUID, reader.header.ctime)
+            header.configurations = reader.header.configurations
+            header.devices = reader.header.devices
+
+            if self.args.verbose:
+                for name in reader.header.configurations:
+                    print("  repack config", name, file=sys.stderr)
+
+                for dev_id, (name, size) in reader.header.devices.items():
+                    print(f"  repack device {dev_id} ({format_size(size)})", name, file=sys.stderr)
+
+            with OutputFile(self.args.destination, self.args.verbose) as dst:
+                dst.write(header.pack())
 
                 extent = None
                 for blockinfo in reader.iter_ordered_blocks(self.args.progress):
@@ -887,8 +961,6 @@ class Main:
 
                 if extent is not None:
                     dst.write(extent.pack())
-
-        os.rename(self.args.destination + ".tmp", self.args.destination)
 
 
 def parse_arguments():
