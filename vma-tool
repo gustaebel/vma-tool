@@ -108,7 +108,7 @@ class _Structure:
     _struct = Struct("")
 
     def __init__(self):
-        self._buf = io.BytesIO()
+        self._bufobj = io.BytesIO()
 
     @classmethod
     def read(cls, fobj):
@@ -118,7 +118,7 @@ class _Structure:
         buf = safe_read(fobj, cls._struct.size)
         obj = cls.__new__(cls) # we don't call __init__()
         obj._offset = offset
-        obj._buf = buf
+        obj._buffer = buf
         obj.unpack(fobj, cls._struct.unpack(buf))
         return obj
 
@@ -179,6 +179,7 @@ class VMAHeader(_Structure):
         self.dev_id = 1
 
     def unpack(self, fobj, record):
+        # pylint:disable=protected-access
         magic, version, self.uuid, self.ctime, self.md5sum, self.blob_buffer_offset, \
                 self.blob_buffer_size, self.header_size = record[:8]
 
@@ -192,10 +193,10 @@ class VMAHeader(_Structure):
         config_data = record[264:520]
 
         dev_info = VMADeviceInfo.read_array(fobj, VMA_MAX_DEVICES)
-        self._buf += b"".join(d._buf for d in dev_info)
+        self._buffer += b"".join(d._buffer for d in dev_info)
 
         blob_buffer = BlobBuffer.read(fobj, self.blob_buffer_size)
-        self._buf += blob_buffer._buf + safe_read(fobj, self.header_size - fobj.tell())
+        self._buffer += blob_buffer._buffer + safe_read(fobj, self.header_size - fobj.tell())
 
         self.configurations = {}
         for name_ptr, data_ptr in zip(config_names, config_data):
@@ -212,7 +213,7 @@ class VMAHeader(_Structure):
             name = os.fsdecode(blob_buffer[dev.devname_ptr])
             self.devices[dev_id] = (name, dev_info[dev_id].size)
 
-        if md5(self._buf[:32] + b"\0" * 16 + self._buf[48:]) != self.md5sum:
+        if md5(self._buffer[:32] + b"\0" * 16 + self._buffer[48:]) != self.md5sum:
             raise SystemExit(f"ERROR: corrupt file, damaged VMA header at 0x{self._offset:x}!")
 
     def add_config(self, name, data):
@@ -254,18 +255,18 @@ class VMAHeader(_Structure):
 
         dev_info_buf = b"".join(d.pack() for d in dev_info)
 
-        self._buf.write(self._struct.pack(b"VMA\0", 1, self.uuid, self.ctime, b"\0" * 16,
+        self._bufobj.write(self._struct.pack(b"VMA\0", 1, self.uuid, self.ctime, b"\0" * 16,
                                           VMA_HEADER_SIZE, self.blob_buffer.size,
                                           VMA_HEADER_SIZE + block512(self.blob_buffer.size),
                                           *config_names, *config_data))
 
-        self._buf.write(dev_info_buf)
-        self._buf.write(self.blob_buffer.pack())
+        self._bufobj.write(dev_info_buf)
+        self._bufobj.write(self.blob_buffer.pack())
 
-        buf = self._buf.getbuffer()
+        buf = self._bufobj.getbuffer()
         buf[32:48] = md5(buf)
         buf.release()
-        return self._buf.getvalue()
+        return self._bufobj.getvalue()
 
 
 class BlobBuffer(dict):
@@ -275,13 +276,13 @@ class BlobBuffer(dict):
     _struct = Struct("<H")
 
     def __init__(self):
-        self._buf = io.BytesIO()
+        self._bufobj = io.BytesIO()
 
     @property
     def size(self):
         """Return the size of the blob buffer.
         """
-        return self._buf.tell()
+        return self._bufobj.tell()
 
     @classmethod
     def read(cls, fobj, size):
@@ -292,7 +293,7 @@ class BlobBuffer(dict):
 
         obj = cls.__new__(cls)
         obj._offset = offset
-        obj._buf = buf
+        obj._buffer = buf
 
         s = cls._struct.size
         o = 1 # skip the first byte
@@ -310,20 +311,20 @@ class BlobBuffer(dict):
     def add_blob(self, s):
         """Add raw data to the blob buffer.
         """
-        offset = self._buf.tell()
+        offset = self._bufobj.tell()
         if offset == 0:
             # There is one null-byte padding at the start of the blob buffer.
-            self._buf.write(b"\0")
+            self._bufobj.write(b"\0")
             offset = 1
 
-        self._buf.write(self._struct.pack(len(s)))
-        self._buf.write(s)
+        self._bufobj.write(self._struct.pack(len(s)))
+        self._bufobj.write(s)
         return offset
 
     def pack(self):
         """Return a structured buffer representation of this instance.
         """
-        buf = self._buf.getvalue()
+        buf = self._bufobj.getvalue()
         return buf + b"\0" * (block512(len(buf)) - len(buf))
 
 
@@ -412,15 +413,16 @@ class VMAExtentHeader(_Structure):
         self.blockinfos = []
 
     def unpack(self, fobj, record):
+        # pylint:disable=protected-access
         magic, self.block_count, self.uuid, self.md5sum = record
 
         if magic != b"VMAE":
             raise SystemExit(f"ERROR: corrupt file, no VMA extent found at 0x{self._offset:x}!")
 
         self.blockinfo = Blockinfo.read_array(fobj, VMA_BLOCKS_PER_EXTENT)
-        self._buf += b"".join(b._buf for b in self.blockinfo)
+        self._buffer += b"".join(b._buffer for b in self.blockinfo)
 
-        if md5(self._buf[:24] + b"\0" * 16 + self._buf[40:]) != self.md5sum:
+        if md5(self._buffer[:24] + b"\0" * 16 + self._buffer[40:]) != self.md5sum:
             raise SystemExit(f"ERROR: corrupt file, damaged VMA extent at 0x{self._offset:x}!")
 
     def add(self, dev_id, cluster_num, cluster):
@@ -450,16 +452,16 @@ class VMAExtentHeader(_Structure):
                 blocks_buf.write(blockinfo.get_blocks())
 
         # Build the header structure.
-        self._buf.write(self._struct.pack(b"VMAE", self.block_count, self.uuid, b"\0" * 16))
-        self._buf.write(blockinfo_buf.getvalue())
+        self._bufobj.write(self._struct.pack(b"VMAE", self.block_count, self.uuid, b"\0" * 16))
+        self._bufobj.write(blockinfo_buf.getvalue())
 
-        buf = self._buf.getbuffer()
+        buf = self._bufobj.getbuffer()
         buf[24:40] = md5(buf)
         buf.release()
 
         # Add the block data.
-        self._buf.write(blocks_buf.getvalue())
-        return self._buf.getvalue()
+        self._bufobj.write(blocks_buf.getvalue())
+        return self._bufobj.getvalue()
 
 
 class Config:
@@ -609,6 +611,7 @@ class VMAReader:
             try:
                 cache[dev_id][blockinfo.cluster_num] = blockinfo
             except KeyError:
+                # pylint:disable=raise-missing-from
                 raise SystemExit(f"ERROR: found cluster for device {dev_id} too far in the area "\
                         f"of device {cur_dev_id}!")
 
