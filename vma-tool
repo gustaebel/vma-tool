@@ -46,6 +46,7 @@ from struct import Struct
 from uuid import UUID, uuid4
 
 OPTIMIZED_UUID = bytes.fromhex("12345678aabbccddeeffaabbccddeeff")
+ZERO_BLOCK = b"\0" * 4096
 
 VMA_CLUSTER_SIZE = 65536
 VMA_HEADER_SIZE = 12288
@@ -126,13 +127,11 @@ class _Structure:
             a.append(cls.read(fobj))
         return a
 
-    # FIXME name
     def unpack(self, fobj, record):
         """Initialize an instance from the values in <record>.
         """
         raise NotImplementedError
 
-    # FIXME name
     def pack(self):
         """Return a structured buffer representation of this instance.
         """
@@ -235,17 +234,18 @@ class VMAHeader(_Structure):
                 config_names.append(0)
                 config_data.append(0)
             else:
+                name = os.fsencode(name)
                 config_names.append(self.blob_buffer.add_string(name))
                 config_data.append(self.blob_buffer.add_blob(data))
 
         dev_info = []
-        devices = sorted(self.devices.items())
-        for i in range(VMA_MAX_DEVICES):
+        for dev_id in range(VMA_MAX_DEVICES):
             try:
-                dev_id, (name, size) = devices.pop()
-            except IndexError:
+                name, size = self.devices[dev_id]
+            except KeyError:
                 dev_info.append(VMADeviceInfo(0, 0))
             else:
+                name = os.fsencode(name)
                 dev_info.append(VMADeviceInfo(self.blob_buffer.add_string(name), size))
 
         dev_info_buf = b"".join(d.pack() for d in dev_info)
@@ -256,7 +256,6 @@ class VMAHeader(_Structure):
                                           *config_names, *config_data))
 
         self._buf.write(dev_info_buf)
-
         self._buf.write(self.blob_buffer.pack())
 
         buf = self._buf.getbuffer()
@@ -339,21 +338,36 @@ class Blockinfo(_Structure):
 
     def unpack(self, fobj, record):
         self.mask, self.dev_id, self.cluster_num = record
+        self.blocks = []
 
-    def iterate(self, fobj):
-        """Iterate over the blocks of data in this Blockinfo. Holes are yielded as None values.
+    def read_blocks(self, fobj):
+        """Read the blocks of data in this Blockinfo. Holes are stored as None values.
         """
+        if self.blocks:
+            return
+
         mask = self.mask
         for _ in range(16):
             if mask & 1:
-                yield safe_read(fobj, 4096)
+                self.blocks.append(safe_read(fobj, 4096))
             else:
-                yield None
+                self.blocks.append(None)
             mask >>= 1
+
+    def get_blocks(self):
+        """Return the blocks as a complete cluster omitting zero blocks.
+        """
+        return b"".join(block for block in self.blocks if block is not None)
+
+    def get_cluster(self):
+        """Return the blocks as a 64 KiB cluster with zero blocks instead of holes.
+        """
+        return b"".join(ZERO_BLOCK if block is None else block for block in self.blocks)
 
     def add(self, cluster):
         """Store a cluster of blocks.
         """
+        count = 0
         for i in range(16):
             offset = i * 4096
             block = cluster[offset:offset+4096]
@@ -361,14 +375,17 @@ class Blockinfo(_Structure):
             if not block:
                 # If a file does not line up to 65536 bytes,
                 # we add "holes" at the end.
-                block = b"\0" * 4096
+                block = ZERO_BLOCK
 
             self.mask >>= 1
             if block.count(b"\0") != 4096:
                 self.mask |= 1 << 15
                 self.blocks.append(block)
+                count += 1
+            else:
+                self.blocks.append(None)
 
-        return len(self.blocks)
+        return count
 
     def pack(self):
         return self._struct.pack(self.mask, self.dev_id, self.cluster_num)
@@ -379,6 +396,14 @@ class VMAExtentHeader(_Structure):
     """
 
     _struct = Struct("> 4s 2x H 16s 16s")
+
+    def __init__(self, uuid):
+        super().__init__()
+
+        self.uuid = uuid
+
+        self.block_count = 0
+        self.blockinfos = []
 
     def unpack(self, fobj, record):
         magic, self.block_count, self.uuid, self.md5sum = record
@@ -392,22 +417,11 @@ class VMAExtentHeader(_Structure):
         if md5(self._buf[:24] + b"\0" * 16 + self._buf[40:]) != self.md5sum:
             raise SystemExit(f"ERROR: corrupt file, damaged VMA extent at 0x{self._offset:x}!")
 
-    def __init__(self, dev_id, uuid, cluster_num):
-        super().__init__()
-
-        self.dev_id = dev_id
-        self.uuid = uuid
-        self.cluster_num = cluster_num
-
-        self.block_count = 0
-        self.blockinfos = []
-
-    def add(self, cluster):
+    def add(self, dev_id, cluster_num, cluster):
         """Add a cluster of data to the extent.
         """
-        blockinfo = Blockinfo(self.dev_id, self.cluster_num)
+        blockinfo = Blockinfo(dev_id, cluster_num)
         self.block_count += blockinfo.add(cluster)
-        self.cluster_num += 1
         self.blockinfos.append(blockinfo)
         return len(self.blockinfos) == VMA_BLOCKS_PER_EXTENT
 
@@ -416,8 +430,9 @@ class VMAExtentHeader(_Structure):
         if not self.blockinfos:
             return b""
 
-        # First, build the table of blockinfo objects.
+        # Build the table of blockinfo objects and the buffer with the block data.
         blockinfo_buf = io.BytesIO()
+        blocks_buf = io.BytesIO()
         for i in range(VMA_BLOCKS_PER_EXTENT):
             try:
                 blockinfo = self.blockinfos[i]
@@ -426,6 +441,7 @@ class VMAExtentHeader(_Structure):
                 blockinfo_buf.write(b"\0" * Blockinfo._struct.size)
             else:
                 blockinfo_buf.write(blockinfo.pack())
+                blocks_buf.write(blockinfo.get_blocks())
 
         # Build the header structure.
         self._buf.write(self._struct.pack(b"VMAE", self.block_count, self.uuid, b"\0" * 16))
@@ -435,10 +451,8 @@ class VMAExtentHeader(_Structure):
         buf[24:40] = md5(buf)
         buf.release()
 
-        for blockinfo in self.blockinfos:
-            for block in blockinfo.blocks:
-                self._buf.write(block)
-
+        # Add the block data.
+        self._buf.write(blocks_buf.getvalue())
         return self._buf.getvalue()
 
 
@@ -525,14 +539,13 @@ class VMAReader:
             print(f"  {dev_id}: {name} ({format_size(size)})")
         print()
 
-    def check_optimized(self, bytes_to_read=None):
-        """Check if the VMA file is optimized, i.e. if the data is ordered and if it uses the
-           default uuid.
+    def iter_blocks(self, progress=False):
+        """Generate Blockinfo objects for all device ids in the order they are stored.
         """
-        optimized_uuid = self.header.uuid == OPTIMIZED_UUID
+        if progress:
+            total = os.fstat(self.fobj.fileno()).st_size
 
-        counter = {dev_id: 0 for dev_id in self.header.devices}
-        cluster_num = {}
+        seen = set()
         while True:
             offset = self.fobj.tell()
             try:
@@ -544,18 +557,95 @@ class VMAReader:
                 raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
 
             for blockinfo in extent.blockinfo:
-                dev_id = blockinfo.dev_id
+                if blockinfo.dev_id > 0:
+                    key = (blockinfo.dev_id, blockinfo.cluster_num)
+                    if key in seen:
+                        print(f"ERROR: found duplicate cluster {key!r}!")
+                    else:
+                        seen.add(key)
 
-                if dev_id not in self.header.devices:
+                    blockinfo.read_blocks(self.fobj)
+                    yield blockinfo
+
+            if progress:
+                print(f"\r  progress: {offset / total * 100:.1f}% ", end="", file=sys.stderr,
+                      flush=True)
+
+        if progress:
+            print(file=sys.stderr)
+
+    def iter_ordered_blocks(self, progress):
+        """Generate Blockinfo objects for all device ids in ascending order.
+        """
+        # NOTE: Please note that:
+        # - Devices are stored one after the other in descending order. Can we rely on the order?
+        # - Device clusters are stored in no particular individual order, but ascending overall.
+        # - Although devices are stored one after the other, individual clusters of different
+        #   devices mix at the boundaries in many cases.
+        # - We cannot safely say that we have seen the last cluster for a specific device, because
+        #   "hole" clusters at the end of a device are not stored.
+
+        threshold = 100
+        max_cache = threshold * 2
+
+        cluster_num = {dev_id: 0 for dev_id in self.header.devices}
+        cache = {dev_id: {} for dev_id in self.header.devices}
+        cur_dev_id = None
+
+        for blockinfo in self.iter_blocks(progress):
+            dev_id = blockinfo.dev_id
+            if dev_id not in self.header.devices:
+                continue
+            elif cur_dev_id is None:
+                cur_dev_id = dev_id
+
+            # Put the cluster in the cache.
+            try:
+                cache[dev_id][blockinfo.cluster_num] = blockinfo
+            except KeyError:
+                raise SystemExit(f"ERROR: found cluster for device {dev_id} in device {cur_dev_id}!")
+
+            # Yield all clusters from the cache that are in the right order.
+            while cache[cur_dev_id] and cluster_num[cur_dev_id] in cache[cur_dev_id]:
+                yield cache[cur_dev_id].pop(cluster_num[cur_dev_id])
+                cluster_num[cur_dev_id] += 1
+
+            # We do not switch to the next device unless the cache already has more than
+            # <threshold> clusters for it.
+            for d, c in list(cache.items()):
+                if d == cur_dev_id:
                     continue
+                if len(c) >= threshold and not cache[cur_dev_id]:
+                    del cache[cur_dev_id]
+                    cur_dev_id = d
+                    break
+                elif len(c) >= max_cache:
+                    # Bail out if the cache for the next device continues to fill up but the
+                    # current device is never completed.
+                    raise SystemExit("ERROR: unable to detect boundary between device "\
+                            f"{cur_dev_id} and {d}!")
 
-                for _ in blockinfo.iterate(self.fobj):
-                    pass
+        if cur_dev_id is not None:
+            assert not cache[cur_dev_id]
 
-                if blockinfo.cluster_num != cluster_num.get(dev_id, 0):
-                    counter[dev_id] += 1
+    def check_optimized(self, bytes_to_read=None):
+        """Check if the VMA file is optimized, i.e. if the data is ordered and if it uses the
+           default uuid.
+        """
+        optimized_uuid = self.header.uuid == OPTIMIZED_UUID
 
-                cluster_num[dev_id] = blockinfo.cluster_num + 1
+        counter = {dev_id: 0 for dev_id in self.header.devices}
+        cluster_num = {}
+        for blockinfo in self.iter_blocks():
+            dev_id = blockinfo.dev_id
+
+            if dev_id not in self.header.devices:
+                continue
+
+            if blockinfo.cluster_num != cluster_num.get(dev_id, 0):
+                counter[dev_id] += 1
+
+            cluster_num[dev_id] = blockinfo.cluster_num + 1
 
             if bytes_to_read is not None and self.fobj.tell() >= bytes_to_read:
                 break
@@ -595,7 +685,9 @@ class VMAReader:
 
             self.extract_devices(devices, sizes, progress)
 
-        finally:
+        except:
+            raise
+        else:
             for dst in devices.values():
                 dst.close()
                 os.rename(dst.name, os.path.splitext(dst.name)[0])
@@ -604,37 +696,18 @@ class VMAReader:
         """Iterate through the VMA file extents and extract the data for all block devices
            simultaneously.
         """
-        total = os.fstat(self.fobj.fileno()).st_size
-        while True:
-            offset = self.fobj.tell()
-            try:
-                extent = VMAExtentHeader.read(self.fobj)
-            except EOF as exc:
-                # pylint:disable=raise-missing-from
-                if exc.offset == offset:
-                    break
-                raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
+        for blockinfo in self.iter_blocks(progress):
+            if blockinfo.dev_id not in devices:
+                continue
 
-            for blockinfo in extent.blockinfo:
-                if blockinfo.dev_id not in devices:
-                    continue
+            dst = devices[blockinfo.dev_id]
+            dst.seek(blockinfo.cluster_num * VMA_CLUSTER_SIZE)
 
-                dst = devices[blockinfo.dev_id]
-                dst.seek(blockinfo.cluster_num * VMA_CLUSTER_SIZE)
-
-                for buf in blockinfo.iterate(self.fobj):
-                    if buf is not None:
-                        dst.write(buf)
-                    else:
-                        dst.seek(4096, os.SEEK_CUR)
-
-                if progress:
-                    pos = self.fobj.tell()
-                    print(f"\r  progress: {pos / total * 100:.1f}% ", end="", file=sys.stderr,
-                          flush=True)
-
-        if progress:
-            print(file=sys.stderr)
+            for buf in blockinfo.blocks:
+                if buf is not None:
+                    dst.write(buf)
+                else:
+                    dst.seek(4096, os.SEEK_CUR)
 
         for dst, size in zip(devices.values(), sizes.values()):
             os.truncate(dst.fileno(), size)
@@ -664,17 +737,13 @@ class Main:
         """
         self._unpack(self.args.destination)
 
-    def _unpack(self, destination, check_optimized=False):
+    def _unpack(self, destination):
         if self.args.verbose:
             print("read", self.args.source)
             print("  working directory:", os.path.abspath(destination))
 
         with open(self.args.source, "rb") as src:
             reader = VMAReader(src)
-            if check_optimized and reader.header.uuid == OPTIMIZED_UUID:
-                if self.args.verbose:
-                    print("  INFO: archive is already optimized")
-                sys.exit(0)
             reader.unpack(destination, self.args.verbose, self.args.progress)
         return reader.header.uuid, reader.header.ctime
 
@@ -732,6 +801,7 @@ class Main:
 
             # Store device files.
             dev_id = 1
+            cluster_num = 0
             pos = 0
             for name in names:
                 if not name.startswith("drive-"):
@@ -742,7 +812,7 @@ class Main:
                     print("\r  pack device", name)
 
                 with open(path, "rb") as src:
-                    extent = VMAExtentHeader(dev_id, uuid, 0)
+                    extent = VMAExtentHeader(uuid)
                     while True:
                         cluster = src.read(VMA_CLUSTER_SIZE)
                         if not cluster:
@@ -753,13 +823,15 @@ class Main:
                             print(f"\r  progress: {pos / total * 100:.1f}% ", end="",
                                   file=sys.stderr, flush=True)
 
-                        if extent.add(cluster):
+                        if extent.add(dev_id, cluster_num, cluster):
                             dst.write(extent.pack())
-                            extent = VMAExtentHeader(dev_id, uuid, extent.cluster_num)
+                            extent = VMAExtentHeader(uuid)
+                        cluster_num += 1
 
                     dst.write(extent.pack())
 
                 dev_id += 1
+                cluster_num = 0
 
             if self.args.progress:
                 print(file=sys.stderr)
@@ -774,12 +846,35 @@ class Main:
             if self.args.verbose:
                 print(f"INFO: optimize {self.args.destination} in-place")
 
-        if self.args.tmpdir is None:
-            self.args.tmpdir = os.path.dirname(self.args.destination)
+        if self.args.verbose:
+            print("read", self.args.source)
 
-        with tempfile.TemporaryDirectory(dir=self.args.tmpdir) as tmpdir:
-            _, ctime = self._unpack(tmpdir, True)
-            self._pack(tmpdir, OPTIMIZED_UUID, ctime)
+        with open(self.args.source, "rb") as src:
+            reader = VMAReader(src)
+            if reader.header.uuid == OPTIMIZED_UUID:
+                if self.args.verbose:
+                    print("  INFO: archive is already optimized")
+                sys.exit(0)
+
+            with open(self.args.destination + ".tmp", "wb") as dst:
+                vma_header = VMAHeader(OPTIMIZED_UUID, reader.header.ctime)
+                vma_header.configurations = reader.header.configurations
+                vma_header.devices = reader.header.devices
+                dst.write(vma_header.pack())
+
+                extent = None
+                for blockinfo in reader.iter_ordered_blocks(self.args.progress):
+                    if extent is None:
+                        extent = VMAExtentHeader(OPTIMIZED_UUID)
+
+                    if extent.add(blockinfo.dev_id, blockinfo.cluster_num, blockinfo.get_cluster()):
+                        dst.write(extent.pack())
+                        extent = None
+
+                if extent is not None:
+                    dst.write(extent.pack())
+
+        os.rename(self.args.destination + ".tmp", self.args.destination)
 
 
 def parse_arguments():
@@ -828,10 +923,6 @@ def parse_arguments():
     optimize_parser.add_argument("-u", "--update", action="append",
                                  type=lambda s: split(s, "="),
                                  help="update configuration entries, e.g. -u name=foobar")
-    optimize_parser.add_argument("-t", "--tmpdir",
-                                 help="use this directory to temporarily store the vma file "\
-                                      "contents, the default is the directory where the "\
-                                      "target file is located")
     optimize_parser.add_argument("source", help="the vma file to read")
     optimize_parser.add_argument("destination", nargs="?",
                                  help="the name of the target vma file")
