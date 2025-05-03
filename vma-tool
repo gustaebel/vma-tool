@@ -45,7 +45,7 @@ import argparse
 from struct import Struct
 from uuid import UUID, uuid4
 
-__version__ = "0.2"
+__version__ = "0.2.1"
 
 OPTIMIZED_UUID = bytes.fromhex("12345678aabbccddeeffaabbccddeeff")
 ZERO_BLOCK = b"\0" * 4096
@@ -744,7 +744,6 @@ class Main:
     def _unpack(self, destination):
         if self.args.verbose:
             print("read", self.args.source)
-            print("  working directory:", os.path.abspath(destination))
 
         with open(self.args.source, "rb") as src:
             reader = VMAReader(src)
@@ -759,7 +758,6 @@ class Main:
     def _pack(self, source, uuid, ctime):
         if self.args.verbose:
             print("write", self.args.destination)
-            print("  working directory:", os.path.abspath(source))
 
         with open(self.args.destination + ".tmp", "wb") as dst:
             vma_header = VMAHeader(uuid, ctime)
