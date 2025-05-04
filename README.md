@@ -50,7 +50,7 @@ is no longer random seems to have no adverse effects.
 
 Far worse with regard to effective deduplication is that the order in which the
 64 KiB data clusters are stored is non-deterministic and therefore different
-every time . This destroys any attempt at deduplication entirely.
+every time. This destroys any attempt at deduplication entirely.
 
 **Solution:** *vma-tool* repacks the VMA file storing all data blocks in the
 correct order.
