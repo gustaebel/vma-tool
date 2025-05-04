@@ -58,6 +58,10 @@ VMA_MAX_DEVICES = 256
 VMA_BLOCKS_PER_EXTENT = 59
 
 
+class VMAError(Exception):
+    """Exception for input processing errors.
+    """
+
 class EOF(EOFError):
     """An EOFError subclass that stores a file offset.
     """
@@ -190,10 +194,10 @@ class VMAHeader(_Structure):
                 self.blob_buffer_size, self.header_size = record[:8]
 
         if magic != b"VMA\0":
-            raise SystemExit("ERROR: not a VMA file")
+            raise VMAError("not a VMA file")
 
         if version != 1:
-            raise SystemExit("ERROR: only VMA version 1 is supported!")
+            raise VMAError("only VMA version 1 is supported!")
 
         config_names = record[8:264]
         config_data = record[264:520]
@@ -220,7 +224,7 @@ class VMAHeader(_Structure):
             self.devices[dev_id] = (name, dev_info[dev_id].size)
 
         if md5(self._buffer[:32] + b"\0" * 16 + self._buffer[48:]) != self.md5sum:
-            raise SystemExit(f"ERROR: corrupt file, damaged VMA header at 0x{self._offset:x}!")
+            raise VMAError(f"corrupt file, damaged VMA header at 0x{self._offset:x}!")
 
     def add_config(self, name, data):
         """Add a configuration file to the blob buffer.
@@ -423,13 +427,13 @@ class VMAExtentHeader(_Structure):
         magic, self.block_count, self.uuid, self.md5sum = record
 
         if magic != b"VMAE":
-            raise SystemExit(f"ERROR: corrupt file, no VMA extent found at 0x{self._offset:x}!")
+            raise VMAError(f"corrupt file, no VMA extent found at 0x{self._offset:x}!")
 
         self.blockinfo = Blockinfo.read_array(fobj, VMA_BLOCKS_PER_EXTENT)
         self._buffer += b"".join(b._buffer for b in self.blockinfo)
 
         if md5(self._buffer[:24] + b"\0" * 16 + self._buffer[40:]) != self.md5sum:
-            raise SystemExit(f"ERROR: corrupt file, damaged VMA extent at 0x{self._offset:x}!")
+            raise VMAError(f"corrupt file, damaged VMA extent at 0x{self._offset:x}!")
 
     def add(self, dev_id, cluster_num, cluster):
         """Add a cluster of data to the extent.
@@ -570,13 +574,13 @@ class VMAReader:
                 # pylint:disable=raise-missing-from
                 if exc.offset == offset:
                     break
-                raise SystemExit(f"ERROR: corrupt file, short VMA extent at 0x{exc.offset:x}!")
+                raise VMAError(f"corrupt file, short VMA extent at 0x{exc.offset:x}!")
 
             for blockinfo in extent.blockinfo:
                 if blockinfo.dev_id > 0:
                     key = (blockinfo.dev_id, blockinfo.cluster_num)
                     if key in seen:
-                        raise SystemExit(f"ERROR: found duplicate cluster {key!r}!")
+                        raise VMAError(f"found duplicate cluster {key!r}!")
                     else:
                         seen.add(key)
 
@@ -621,7 +625,7 @@ class VMAReader:
                 cache[dev_id][blockinfo.cluster_num] = blockinfo
             except KeyError:
                 # pylint:disable=raise-missing-from
-                raise SystemExit(f"ERROR: found cluster for device {dev_id} too far in the area "\
+                raise VMAError(f"found cluster for device {dev_id} too far in the area "\
                         f"of device {cur_dev_id}!")
 
             # Yield all clusters from the cache that are in the right order.
@@ -642,7 +646,7 @@ class VMAReader:
                 elif len(c) >= max_cache:
                     # Bail out if the cache for the next device continues to fill up but the
                     # current device is never completed.
-                    raise SystemExit("ERROR: unable to detect boundary between device "\
+                    raise VMAError("unable to detect boundary between device "\
                             f"{cur_dev_id} and {d}!")
 
         if cur_dev_id is not None:
@@ -1032,4 +1036,8 @@ def parse_arguments():
 
 if __name__ == "__main__":
     main = Main()
-    main.run()
+    try:
+        main.run()
+    except VMAError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
