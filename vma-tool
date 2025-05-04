@@ -973,22 +973,23 @@ def parse_arguments():
     subparsers = parser.add_subparsers()
 
     dump_parser = subparsers.add_parser("info",
-                                help="show information and table of contents for a vma file")
+            description="Show information and the table of contents for a VMA file.")
     dump_parser.set_defaults(command="info")
-    dump_parser.add_argument("source", help="the vma file to read")
+    dump_parser.add_argument("source", nargs="?", default="-", help="the vma file to read")
 
     unpack_parser = subparsers.add_parser("unpack",
-                                          help="unpack the contents of a vma file to a directory")
+            description="Unpack the contents of a VMA file to a directory.")
     unpack_parser.set_defaults(command="unpack")
     unpack_parser.add_argument("-q", "--quiet", action="store_false", dest="verbose",
                                default=True, help="suppress informational output")
     unpack_parser.add_argument("-P", "--no-progress", action="store_false", dest="progress",
                                help="suppress progress output")
-    unpack_parser.add_argument("source", help="the vma file to read")
+    unpack_parser.add_argument("source", nargs="?", default="-", help="the vma file to read")
     unpack_parser.add_argument("destination", default=os.getcwd(),
                                help="extract to this directory")
 
-    pack_parser = subparsers.add_parser("pack", help="create a vma file from a directory")
+    pack_parser = subparsers.add_parser("pack", help="create a vma file from a directory",
+            description="Pack a directory into a VMA file.")
     pack_parser.set_defaults(command="pack")
     pack_parser.add_argument("-q", "--quiet", action="store_false", dest="verbose",
                              default=True, help="suppress informational output")
@@ -999,10 +1000,11 @@ def parse_arguments():
     pack_parser.add_argument("-O", "--optimize", action="store_true", default=False,
                              help="optimize for better deduplication")
     pack_parser.add_argument("source", help="a directory with configuration and device files")
-    pack_parser.add_argument("destination", help="the name of the target vma file")
+    pack_parser.add_argument("destination", nargs="?", default="-",
+                             help="the name of the target vma file")
 
     optimize_parser = subparsers.add_parser("optimize",
-                    help="repack a vma file to optimize its deduplication properties")
+            description="Repack a vma file to optimize its deduplication properties.")
     optimize_parser.set_defaults(command="optimize")
     optimize_parser.add_argument("-q", "--quiet", action="store_false", dest="verbose",
                                  default=True, help="suppress informational output")
@@ -1011,8 +1013,8 @@ def parse_arguments():
     optimize_parser.add_argument("-u", "--update", action="append", type=lambda s: split(s, "="),
                                  default=(),
                                  help="update configuration entries, e.g. -u name=foobar")
-    optimize_parser.add_argument("source", help="the vma file to read")
-    optimize_parser.add_argument("destination", nargs="?",
+    optimize_parser.add_argument("source", nargs="?", default="-", help="the vma file to read")
+    optimize_parser.add_argument("destination", nargs="?", default=None,
                                  help="the name of the target vma file")
 
     args = parser.parse_args()
