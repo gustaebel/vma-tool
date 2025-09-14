@@ -45,7 +45,7 @@ import argparse
 from struct import Struct
 from uuid import UUID, uuid4
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 OPTIMIZED_UUID = bytes.fromhex("12345678aabbccddeeffaabbccddeeff")
 ZERO_BLOCK = b"\0" * 4096
@@ -606,7 +606,7 @@ class VMAReader:
         # - We cannot safely say that we have seen the last cluster for a specific device, because
         #   "hole" clusters at the end of a device are not stored.
 
-        threshold = 100
+        threshold = 1000
         max_cache = threshold * 2
 
         cluster_num = {dev_id: 0 for dev_id in self.header.devices}
