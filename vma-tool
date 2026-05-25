@@ -395,7 +395,7 @@ class Blockinfo(_Structure):
                 block = ZERO_BLOCK
 
             self.mask >>= 1
-            if block.count(b"\0") != 4096:
+            if block != ZERO_BLOCK:
                 self.mask |= 1 << 15
                 self.blocks.append(block)
                 count += 1
